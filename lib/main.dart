@@ -149,6 +149,9 @@ class _HomePageState extends State<HomePage> {
   // V3.6: Smart Media Rear Controller
   bool _smartMediaEnabled = false; // Default disabled
 
+  // Smart Navigation Dashboard
+  bool _smartNavigationEnabled = false; // Default disabled
+
   @override
   void initState() {
     super.initState();
@@ -476,6 +479,10 @@ class _HomePageState extends State<HomePage> {
         _smartMediaEnabled =
             prefs.getBool('smart_media_enabled') ??
             false; // Smart Media Rear Controller 
+
+        _smartNavigationEnabled =
+            prefs.getBool('smart_navigation_enabled') ??
+            false; // Smart Navigation Dashboard
       });
 
       // 启动充电服务（如果开关打开）
@@ -768,6 +775,23 @@ class _HomePageState extends State<HomePage> {
       print('Failed to toggle Smart Media Controller: $e');
       setState(() {
         _smartMediaEnabled = !enabled;
+      });
+    }
+  }
+
+  Future<void> _toggleSmartNavigation(bool enabled) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('smart_navigation_enabled', enabled);
+
+      setState(() {
+        _smartNavigationEnabled = enabled;
+      });
+      print('Smart Navigation Dashboard turned ${enabled ? "ON" : "OFF"}');
+    } catch (e) {
+      print('Failed to toggle Smart Navigation Dashboard: $e');
+      setState(() {
+        _smartNavigationEnabled = !enabled;
       });
     }
   }
@@ -1554,6 +1578,64 @@ class _HomePageState extends State<HomePage> {
                                     onChanged: _toggleSmartMedia,
                                   ),
                                 ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 20),
+
+                  // Smart Navigation Dashboard Card
+                  CustomPaint(
+                    painter: _SquircleBorderPainter(
+                      radius: _SquircleRadii.large,
+                      color: Colors.white.withOpacity(0.5),
+                      strokeWidth: 1.5,
+                    ),
+                    child: ClipPath(
+                      clipper: _SquircleClipper(
+                        cornerRadius: _SquircleRadii.large,
+                      ),
+                      child: BackdropFilter(
+                        filter: ImageFilter.blur(sigmaX: 0, sigmaY: 0),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 20,
+                            vertical: 16,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.25),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Text(
+                                    AppLocalizations.of(context).translate('🗺️ Smart Navigation Dashboard') ?? '🗺️ Smart Navigation Dashboard',
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.black87,
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  _GradientToggle(
+                                    value: _smartNavigationEnabled,
+                                    onChanged: _toggleSmartNavigation,
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                'Shows Maps turn-by-turn data on the rear screen',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.black54,
+                                ),
                               ),
                             ],
                           ),

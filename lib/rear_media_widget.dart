@@ -2,6 +2,8 @@ import 'dart:ui';
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'smart_navigation_widget.dart';
 
 class RearMediaWidget extends StatefulWidget {
   const RearMediaWidget({super.key});
@@ -28,9 +30,20 @@ class _RearMediaWidgetState extends State<RearMediaWidget> {
   int _lastReceivedTimeMs = 0;
   Timer? _progressTimer;
 
+  // Settings toggle
+  bool _smartNavigationEnabled = false;
+  Timer? _settingsTimer;
+
   @override
   void initState() {
     super.initState();
+    _loadSettings();
+
+    // Poll settings to reflect toggles made in the main UI
+    _settingsTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+      _loadSettings();
+    });
+
     _channel.setMethodCallHandler(_handleMethodCall);
     // Request initial state on launch
     _channel.invokeMethod('requestInitialState');
@@ -42,6 +55,19 @@ class _RearMediaWidgetState extends State<RearMediaWidget> {
         setState(() {}); // Trigger redraw to interpolate current position smoothly
       }
     });
+  }
+
+  Future<void> _loadSettings() async {
+      try {
+          final prefs = await SharedPreferences.getInstance();
+          if (mounted) {
+              setState(() {
+                  _smartNavigationEnabled = prefs.getBool('smart_navigation_enabled') ?? false;
+              });
+          }
+      } catch (e) {
+          debugPrint("Failed to load settings in RearMediaWidget: $e");
+      }
   }
 
   Future<void> _handleMethodCall(MethodCall call) async {
@@ -103,6 +129,7 @@ class _RearMediaWidgetState extends State<RearMediaWidget> {
   @override
   void dispose() {
     _progressTimer?.cancel();
+    _settingsTimer?.cancel();
     super.dispose();
   }
 
@@ -321,6 +348,12 @@ class _RearMediaWidgetState extends State<RearMediaWidget> {
                 ],
               ),
             ),
+
+            // 4. Smart Navigation Overlay Layer
+            if (_smartNavigationEnabled)
+                const Positioned.fill(
+                    child: SmartNavigationWidget(),
+                ),
           ],
         ),
       ),

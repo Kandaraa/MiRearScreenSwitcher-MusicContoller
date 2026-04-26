@@ -33,10 +33,14 @@ import io.flutter.embedding.android.FlutterActivity;
 import io.flutter.embedding.engine.FlutterEngine;
 import io.flutter.plugin.common.MethodChannel;
 
+import java.util.HashMap;
+import java.util.Map;
+
 import rikka.shizuku.Shizuku;
 
 public class MainActivity extends FlutterActivity {
     private static final String CHANNEL = "com.display.switcher/task";
+    private static final String NAV_CHANNEL = "com.display.switcher/navigation";
     private static final String TAG = "MainActivity";
     private static final int NOTIFICATION_PERMISSION_REQUEST_CODE = 1001;
     
@@ -49,6 +53,7 @@ public class MainActivity extends FlutterActivity {
     
     private ITaskService taskService;
     private MethodChannel methodChannel;
+    private MethodChannel navChannel;
     private final Shizuku.UserServiceArgs serviceArgs = 
         new Shizuku.UserServiceArgs(new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
             .daemon(false)
@@ -186,6 +191,40 @@ public class MainActivity extends FlutterActivity {
     }
     
     /**
+     * 将解析后的Google Maps导航数据通过MethodChannel发送到Flutter端
+     */
+    public void sendNavigationData(Bundle extras) {
+        if (methodChannel != null && extras != null) {
+            Map<String, Object> data = new HashMap<>();
+            for (String key : extras.keySet()) {
+                Object value = extras.get(key);
+                // Convert value to something MethodChannel can serialize
+                if (value instanceof CharSequence) {
+                    data.put(key, value.toString());
+                } else if (value instanceof Integer || value instanceof Long || value instanceof Float || value instanceof Double || value instanceof Boolean) {
+                    data.put(key, value);
+                } else if (value instanceof byte[]) {
+                    data.put(key, value);
+                }
+            }
+            runOnUiThread(() -> {
+                navChannel.invokeMethod("updateNavigationState", data);
+            });
+        }
+    }
+
+    /**
+     * 通知Flutter端隐藏导航面板
+     */
+    public void hideNavigationData() {
+        if (navChannel != null) {
+            runOnUiThread(() -> {
+                navChannel.invokeMethod("hideNavigationState", null);
+            });
+        }
+    }
+
+    /**
      * 在背屏启动通知显示Activity
      */
     private void startNotificationOnRearScreen(String packageName, String title, String text, long when) {
@@ -303,6 +342,8 @@ public class MainActivity extends FlutterActivity {
         super.configureFlutterEngine(flutterEngine);
         
         methodChannel = new MethodChannel(flutterEngine.getDartExecutor().getBinaryMessenger(), CHANNEL);
+        navChannel = new MethodChannel(flutterEngine.getDartExecutor().getBinaryMessenger(), NAV_CHANNEL);
+
         methodChannel.setMethodCallHandler((call, result) -> {
                 switch (call.method) {
                     case "checkShizuku": {

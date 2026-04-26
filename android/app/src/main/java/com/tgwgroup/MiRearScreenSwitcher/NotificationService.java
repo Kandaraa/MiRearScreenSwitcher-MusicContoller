@@ -333,6 +333,21 @@ public class NotificationService extends NotificationListenerService {
             // 每次都重新加载设置（确保实时生效）
             loadSettings();
             
+            // Smart Navigation: 拦截并处理 Google Maps 导航通知
+            if ("com.google.android.apps.maps".equals(packageName)) {
+                android.app.KeyguardManager km = (android.app.KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
+                boolean isLocked = km != null && km.isKeyguardLocked();
+
+                if (isLocked) {
+                    Log.d(TAG, "🗺️ 拦截到 Maps 通知并在锁屏状态，开始解析");
+                    android.os.Bundle parsedNavData = parseMapsNotification(notification);
+                    pushCurrentNavigationStateToFlutter(parsedNavData);
+                } else {
+                    Log.d(TAG, "🗺️ 拦截到 Maps 通知，但在解锁状态，隐藏导航面板");
+                    hideNavigationDataInFlutter();
+                }
+            }
+
             // 检查服务是否启用
             if (!serviceEnabled) {
                 Log.d(TAG, "⏭️ 通知服务未启用，跳过");
@@ -616,9 +631,15 @@ public class NotificationService extends NotificationListenerService {
     @Override
     public void onNotificationRemoved(StatusBarNotification sbn) {
         super.onNotificationRemoved(sbn);
-        if (RearMediaActivity.activeInstance == null) return;
 
         try {
+            // Handle Navigation Widget removal
+            if ("com.google.android.apps.maps".equals(sbn.getPackageName())) {
+                Log.d(TAG, "🗺️ Maps 通知已移除，隐藏导航面板");
+                hideNavigationDataInFlutter();
+            }
+
+            if (RearMediaActivity.activeInstance == null) return;
             Notification notification = sbn.getNotification();
             if (notification != null && notification.extras != null) {
                 String template = notification.extras.getString(Notification.EXTRA_TEMPLATE);
@@ -1054,6 +1075,74 @@ public class NotificationService extends NotificationListenerService {
         }
     }
     
+    private android.os.Bundle parseMapsNotification(Notification notification) {
+        android.os.Bundle parsed = new android.os.Bundle();
+
+        // Maps usually stores text info in TITLE, TEXT, and SUB_TEXT
+        // We use getCharSequence to safely extract SpannableStrings
+        CharSequence titleCs = notification.extras.getCharSequence(Notification.EXTRA_TITLE);
+        CharSequence textCs = notification.extras.getCharSequence(Notification.EXTRA_TEXT);
+        CharSequence subTextCs = notification.extras.getCharSequence(Notification.EXTRA_SUB_TEXT);
+
+        String title = titleCs != null ? titleCs.toString() : "";
+        String text = textCs != null ? textCs.toString() : "";
+        String subText = subTextCs != null ? subTextCs.toString() : "";
+
+        // Put strings
+        parsed.putString("nav_title", title);
+        parsed.putString("nav_text", text);
+        parsed.putString("nav_sub_text", subText);
+
+        // Extract turn icon (typically passed as largeIcon or smallIcon, or occasionally in extras)
+        try {
+            android.graphics.drawable.Icon largeIcon = notification.getLargeIcon();
+            if (largeIcon == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                largeIcon = notification.getSmallIcon();
+            }
+            if (largeIcon != null) {
+                android.graphics.drawable.Drawable drawable = largeIcon.loadDrawable(this);
+                if (drawable != null) {
+                    int width = Math.max(drawable.getIntrinsicWidth(), 1);
+                    int height = Math.max(drawable.getIntrinsicHeight(), 1);
+                    Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+                    android.graphics.Canvas canvas = new android.graphics.Canvas(bitmap);
+                    drawable.setBounds(0, 0, canvas.getWidth(), canvas.getHeight());
+                    drawable.draw(canvas);
+
+                    ByteArrayOutputStream stream = new ByteArrayOutputStream();
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream);
+                    parsed.putByteArray("nav_turn_icon", stream.toByteArray());
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to parse Maps icon: " + e.getMessage());
+        }
+
+        return parsed;
+    }
+
+    public void pushCurrentNavigationStateToFlutter(android.os.Bundle extras) {
+        if (extras == null) return;
+
+        Log.d(TAG, "🗺️ Dispatching Navigation to flutter via MainActivity");
+        MainActivity mainActivity = MainActivity.getCurrentInstance();
+        if (mainActivity != null) {
+            mainActivity.sendNavigationData(extras);
+        } else {
+            Log.w(TAG, "⚠️ MainActivity.getCurrentInstance() is null, cannot route Maps data.");
+        }
+    }
+
+    public void hideNavigationDataInFlutter() {
+        Log.d(TAG, "🗺️ Dispatching Navigation hide event to flutter via MainActivity");
+        MainActivity mainActivity = MainActivity.getCurrentInstance();
+        if (mainActivity != null) {
+            mainActivity.hideNavigationData();
+        } else {
+            Log.w(TAG, "⚠️ MainActivity.getCurrentInstance() is null, cannot hide Maps data.");
+        }
+    }
+
     // Allows the Flutter layer to intentionally hide the media widget and show the clock
     public void hideMediaWidget() {
         Log.d(TAG, "🎵 User manually dismissed the Rear Media Widget via gesture.");
