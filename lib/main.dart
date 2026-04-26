@@ -149,6 +149,9 @@ class _HomePageState extends State<HomePage> {
   // V3.6: Smart Media Rear Controller
   bool _smartMediaEnabled = false; // Default disabled
 
+  // Smart Navigation Dashboard
+  bool _smartNavigationEnabled = false;
+
   @override
   void initState() {
     super.initState();
@@ -476,6 +479,7 @@ class _HomePageState extends State<HomePage> {
         _smartMediaEnabled =
             prefs.getBool('smart_media_enabled') ??
             false; // Smart Media Rear Controller 
+        _smartNavigationEnabled = prefs.getBool('smart_navigation_enabled') ?? false;
       });
 
       // 启动充电服务（如果开关打开）
@@ -733,6 +737,30 @@ class _HomePageState extends State<HomePage> {
       // 切换失败，恢复原状态
       setState(() {
         _chargingAlwaysOnEnabled = !enabled;
+      });
+    }
+  }
+
+  // Smart Navigation
+  Future<void> _toggleSmartNavigation(bool enabled) async {
+    if (enabled) {
+      final bool hasPermission = await platform.invokeMethod(
+        'checkNotificationListenerPermission',
+      ) ?? false;
+      if (!hasPermission) {
+        await platform.invokeMethod('openNotificationListenerSettings');
+        return;
+      }
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('smart_navigation_enabled', enabled);
+      setState(() {
+        _smartNavigationEnabled = enabled;
+      });
+    } catch (e) {
+      setState(() {
+        _smartNavigationEnabled = !enabled;
       });
     }
   }
@@ -1552,6 +1580,53 @@ class _HomePageState extends State<HomePage> {
                                   _GradientToggle(
                                     value: _smartMediaEnabled,
                                     onChanged: _toggleSmartMedia,
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  CustomPaint(
+                    painter: _SquircleBorderPainter(
+                      radius: _SquircleRadii.large,
+                      color: Colors.white.withOpacity(0.5),
+                      strokeWidth: 1.5,
+                    ),
+                    child: ClipPath(
+                      clipper: _SquircleClipper(
+                        cornerRadius: _SquircleRadii.large,
+                      ),
+                      child: BackdropFilter(
+                        filter: ImageFilter.blur(sigmaX: 0, sigmaY: 0),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 20,
+                            vertical: 16,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.25),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Text(
+                                    AppLocalizations.of(context).translate('🗺️ Smart Navigation') ?? 'Smart Navigation Dashboard',
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.black87,
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  _GradientToggle(
+                                    value: _smartNavigationEnabled,
+                                    onChanged: _toggleSmartNavigation,
                                   ),
                                 ],
                               ),
