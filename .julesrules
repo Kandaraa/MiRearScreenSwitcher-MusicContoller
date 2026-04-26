@@ -1,0 +1,10 @@
+# MRSS Project Rules for Jules
+
+You are working on the MiRearScreenSwitcher (MRSS) repository, a Flutter application with deep Android native integrations.
+
+CRITICAL CONSTRAINTS:
+1. **Architecture Mimicry:** For new rear-screen features, you must heavily reference the existing `Smart Music Controller` implementation. Reuse its established logic for AOD (Always-On Display) dimming, lockscreen persistence, double-tap to wake, and swipe gestures.
+2. **UI Guidelines:** Stick strictly to the project's Material 3 design language. Use the established four-color gradients and the exact 2.84 super elliptical fillets for containers. Do not introduce new UI paradigms.
+3. **Data Extraction Constraints:** When intercepting notifications (like Maps or Media), exclusively use the project's existing `NotificationListenerService` infrastructure. Do not build new background polling services.
+4. **Shizuku & Rear Screen API (CRITICAL):** This app operates without ROOT. It relies entirely on the `moe.shizuku.manager` API. Any system-level action (waking the rear screen, toggling display layers, or checking process states) MUST be executed via Shizuku shell command wrappers (e.g., `input keyevent KEYCODE_WAKEUP` or `service call activity_task`). Do not attempt to use standard Android `PowerManager`, `DisplayManager`, or `ActivityManager` methods for rear-screen manipulation if they require system-privileged permissions outside of Shizuku's scope. Always look for existing Shizuku helper classes in the repository before writing new shell commands.
+5. **No Dummy Data:** Do not add mock data or clutter the UI. Only display information actively parsed from native channels.
