@@ -6,14 +6,18 @@ import android.os.Build;
 import android.os.Bundle;
 import android.view.WindowManager;
 import androidx.annotation.NonNull;
+import java.util.Map;
+import java.util.HashMap;
 import io.flutter.embedding.android.FlutterActivity;
 import io.flutter.embedding.engine.FlutterEngine;
 import io.flutter.plugin.common.MethodChannel;
 
 public class RearMediaActivity extends FlutterActivity {
     private static final String MEDIA_CHANNEL = "com.display.switcher/media";
+    private static final String NAV_CHANNEL = "com.display.switcher/navigation";
     public static RearMediaActivity activeInstance = null;
     private MethodChannel channel;
+    private MethodChannel navChannel;
 
     @NonNull
     @Override
@@ -42,6 +46,7 @@ public class RearMediaActivity extends FlutterActivity {
     public void configureFlutterEngine(@NonNull FlutterEngine flutterEngine) {
         super.configureFlutterEngine(flutterEngine);
         channel = new MethodChannel(flutterEngine.getDartExecutor().getBinaryMessenger(), MEDIA_CHANNEL);
+        navChannel = new MethodChannel(flutterEngine.getDartExecutor().getBinaryMessenger(), NAV_CHANNEL);
         
         channel.setMethodCallHandler((call, result) -> {
             if (call.method.equals("playPause")) {
@@ -77,6 +82,33 @@ public class RearMediaActivity extends FlutterActivity {
 
 
     
+    public void sendNavigationData(Bundle extras) {
+        if (navChannel != null && extras != null) {
+            Map<String, Object> map = new HashMap<>();
+
+            CharSequence title = extras.getCharSequence(android.app.Notification.EXTRA_TITLE);
+            CharSequence text = extras.getCharSequence(android.app.Notification.EXTRA_TEXT);
+            CharSequence subText = extras.getCharSequence(android.app.Notification.EXTRA_SUB_TEXT);
+
+            if (title != null) map.put("title", title.toString());
+            if (text != null) map.put("text", text.toString());
+            if (subText != null) map.put("subText", subText.toString());
+
+            byte[] iconBytes = extras.getByteArray("icon_bytes");
+            if (iconBytes != null) {
+                map.put("icon", iconBytes);
+            }
+
+            runOnUiThread(() -> navChannel.invokeMethod("updateNavigationState", map));
+        }
+    }
+
+    public void hideNavigationData() {
+        if (navChannel != null) {
+            runOnUiThread(() -> navChannel.invokeMethod("hideNavigationState", null));
+        }
+    }
+
     // Updates Flutter with current media
     public void updateMediaState(String title, String artist, byte[] albumArt, boolean isPlaying, String appName, byte[] appIcon, long position, long duration, double speed) {
         if (channel != null) {

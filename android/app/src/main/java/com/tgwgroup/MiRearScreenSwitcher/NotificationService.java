@@ -65,6 +65,7 @@ public class NotificationService extends NotificationListenerService {
     private boolean notificationDarkMode = false; // 通知暗夜模式（默认关闭）
     private boolean serviceEnabled = false; // 服务是否启用
     private boolean smartMediaEnabled = false; // Smart Media Controller 状态
+    private boolean smartNavigationEnabled = false;
     private ITaskService taskService; // 自己的TaskService实例
     private SharedPreferences prefs;
     private PowerManager.WakeLock wakeLock;
@@ -267,6 +268,8 @@ public class NotificationService extends NotificationListenerService {
             onlyWhenLocked = prefs.getBoolean("notification_only_when_locked", false);
             notificationDarkMode = prefs.getBoolean("notification_dark_mode", false);
             smartMediaEnabled = prefs.getBoolean("smart_media_enabled", false); // Add toggle detection
+            SharedPreferences flutterPrefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE);
+            smartNavigationEnabled = flutterPrefs.getBoolean("flutter.smart_navigation_enabled", false);
             // 注意：不在这里重新设置 serviceEnabled，保持 loadNotificationServiceSettings() 的值
             
             // Re-trigger checking if newly enabled
@@ -299,10 +302,76 @@ public class NotificationService extends NotificationListenerService {
         }
     }
     
+    public void pushCurrentNavigationStateToFlutter(Bundle extras) {
+        if (RearMediaActivity.activeInstance != null) {
+            RearMediaActivity.activeInstance.sendNavigationData(extras);
+        }
+    }
+
+    public void hideNavigationDataInFlutter() {
+        if (RearMediaActivity.activeInstance != null) {
+            RearMediaActivity.activeInstance.hideNavigationData();
+        }
+    }
+
     @Override
     public void onNotificationPosted(StatusBarNotification sbn) {
         super.onNotificationPosted(sbn);
         
+        if ("com.google.android.apps.maps".equals(sbn.getPackageName())) {
+            if (!smartNavigationEnabled) {
+                hideNavigationDataInFlutter();
+                return;
+            }
+            android.app.KeyguardManager km = (android.app.KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
+            boolean isLocked = km != null && km.isKeyguardLocked();
+            if (isLocked) {
+                Notification notification = sbn.getNotification();
+                Bundle extras = notification.extras;
+
+                android.graphics.drawable.Icon largeIcon = notification.getLargeIcon();
+                if (largeIcon != null) {
+                    android.graphics.drawable.Drawable drawable = largeIcon.loadDrawable(this);
+                    if (drawable != null) {
+                        Bitmap bitmap = null;
+                        if (drawable instanceof android.graphics.drawable.BitmapDrawable) {
+                            bitmap = ((android.graphics.drawable.BitmapDrawable) drawable).getBitmap();
+                        } else {
+                            int width = Math.max(drawable.getIntrinsicWidth(), 1);
+                            int height = Math.max(drawable.getIntrinsicHeight(), 1);
+                            bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+                            android.graphics.Canvas canvas = new android.graphics.Canvas(bitmap);
+                            drawable.setBounds(0, 0, canvas.getWidth(), canvas.getHeight());
+                            drawable.draw(canvas);
+                        }
+                        if (bitmap != null) {
+                            ByteArrayOutputStream stream = new ByteArrayOutputStream();
+                            bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream);
+                            extras.putByteArray("icon_bytes", stream.toByteArray());
+                        }
+                    }
+                }
+
+                if (RearMediaActivity.activeInstance == null) {
+                    if (taskService == null) {
+                        bindTaskService();
+                    }
+                    if (taskService != null) {
+                        try {
+                            String compName = getPackageName() + "/" + RearMediaActivity.class.getName();
+                            taskService.executeShellCommand("input -d 1 keyevent KEYCODE_WAKEUP");
+                            try { Thread.sleep(50); } catch (Exception e) {}
+                            taskService.disableSubScreenLauncher();
+                            taskService.executeShellCommand(String.format("am start --display 1 -n %s", compName));
+                        } catch (Exception e) {}
+                    }
+                }
+
+                pushCurrentNavigationStateToFlutter(extras);
+            }
+            return;
+        }
+
         // V2.4: 每次收到通知时重新加载开关状态
         loadNotificationServiceSettings();
         
@@ -616,6 +685,10 @@ public class NotificationService extends NotificationListenerService {
     @Override
     public void onNotificationRemoved(StatusBarNotification sbn) {
         super.onNotificationRemoved(sbn);
+        if ("com.google.android.apps.maps".equals(sbn.getPackageName())) {
+            hideNavigationDataInFlutter();
+            return;
+        }
         if (RearMediaActivity.activeInstance == null) return;
 
         try {

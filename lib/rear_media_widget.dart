@@ -2,6 +2,7 @@ import 'dart:ui';
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'smart_navigation_widget.dart';
 
 class RearMediaWidget extends StatefulWidget {
   const RearMediaWidget({super.key});
@@ -321,6 +322,7 @@ class _RearMediaWidgetState extends State<RearMediaWidget> {
                 ],
               ),
             ),
+            const Positioned.fill(child: SmartNavigationWidget()),
           ],
         ),
       ),
