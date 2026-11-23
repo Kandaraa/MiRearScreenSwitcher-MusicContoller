@@ -63,6 +63,14 @@ public class AlwaysWakeUpService extends Service {
         }
     };
     
+    private final android.content.BroadcastReceiver backendChangedReceiver = new android.content.BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            taskService = null;
+            bindTaskService();
+        }
+    };
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -71,6 +79,13 @@ public class AlwaysWakeUpService extends Service {
         prefs = getSharedPreferences("mrss_settings", MODE_PRIVATE);
         wakeupHandler = new Handler(Looper.getMainLooper());
         
+        android.content.IntentFilter filter = new android.content.IntentFilter(TaskServiceManager.ACTION_BACKEND_CHANGED);
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(backendChangedReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(backendChangedReceiver, filter);
+        }
+
         // 创建前台通知
         createForegroundNotification();
         
@@ -80,6 +95,12 @@ public class AlwaysWakeUpService extends Service {
     
     private void bindTaskService() {
         try {
+            if (TaskServiceManager.isLocalAdbMode(this)) {
+                taskService = TaskServiceManager.getInstance(this).getLocalAdbBackend().getTaskService();
+                Log.d(TAG, "✓ TaskService connected (Local ADB)");
+                startWakeupLoop();
+                return;
+            }
             if (taskService != null) {
                 Log.d(TAG, "TaskService already bound");
                 return;
@@ -198,16 +219,22 @@ public class AlwaysWakeUpService extends Service {
         Log.d(TAG, "🔴 onDestroy");
         
         stopWakeupLoop();
+        try {
+            unregisterReceiver(backendChangedReceiver);
+        } catch (Exception ignored) {}
         
         // 解绑TaskService
-        try {
-            if (taskService != null) {
-                Shizuku.unbindUserService(serviceArgs, taskServiceConnection, true);
-                Log.d(TAG, "✓ TaskService unbound");
+        if (!TaskServiceManager.isLocalAdbMode(this)) {
+            try {
+                if (taskService != null) {
+                    Shizuku.unbindUserService(serviceArgs, taskServiceConnection, true);
+                    Log.d(TAG, "✓ TaskService unbound");
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to unbind TaskService: " + e.getMessage());
             }
-        } catch (Exception e) {
-            Log.w(TAG, "Failed to unbind TaskService: " + e.getMessage());
         }
+        taskService = null;
         
         super.onDestroy();
     }

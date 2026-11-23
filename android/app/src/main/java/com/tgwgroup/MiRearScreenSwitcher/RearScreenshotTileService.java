@@ -142,6 +142,10 @@ public class RearScreenshotTileService extends TileService {
     }
 
     private void bindTaskService() {
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            taskService = TaskServiceManager.getInstance(this).getLocalAdbBackend().getTaskService();
+            return;
+        }
         if (taskService != null) {
             return;
         }
@@ -161,9 +165,13 @@ public class RearScreenshotTileService extends TileService {
     @Override
     public void onDestroy() {
         super.onDestroy();
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            taskService = null;
+            return;
+        }
         try {
             if (taskService != null) {
-                Shizuku.unbindUserService(serviceArgs, taskServiceConnection, true);
+                Shizuku.unbindUserService(serviceArgs, taskServiceConnection, false);
                 taskService = null;
             }
         } catch (Exception e) {
