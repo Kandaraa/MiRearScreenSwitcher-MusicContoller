@@ -39,16 +39,53 @@ public class MainActivity extends FlutterActivity {
     private static final String CHANNEL = "com.display.switcher/task";
     private static final String TAG = "MainActivity";
     private static final int NOTIFICATION_PERMISSION_REQUEST_CODE = 1001;
+    private static final int LOCAL_NETWORK_PERMISSION_REQUEST_CODE = 1002;
+
+    /**
+     * Adjustment #4: Uses raw string literal "android.permission.ACCESS_LOCAL_NETWORK" and
+     * numeric Build.VERSION.SDK_INT >= 37 so compilation succeeds on SDK 34-36 toolchains.
+     */
+    private void requestLocalNetworkPermissionIfAndroid17() {
+        if (Build.VERSION.SDK_INT >= 37) {
+            try {
+                if (ContextCompat.checkSelfPermission(this, "android.permission.ACCESS_LOCAL_NETWORK")
+                        != PackageManager.PERMISSION_GRANTED) {
+                    ActivityCompat.requestPermissions(
+                            this,
+                            new String[]{"android.permission.ACCESS_LOCAL_NETWORK"},
+                            LOCAL_NETWORK_PERMISSION_REQUEST_CODE
+                    );
+                }
+            } catch (Throwable ignored) {}
+        }
+    }
     
     // 静态实例，供其他类访问
     private static MainActivity currentInstance;
+    private static volatile boolean mainActivityForeground = false;
     
     public static MainActivity getCurrentInstance() {
         return currentInstance;
     }
+
+    public static boolean isMainActivityForeground() {
+        return mainActivityForeground;
+    }
     
     private ITaskService taskService;
     private MethodChannel methodChannel;
+    private final java.util.concurrent.atomic.AtomicInteger taskThreadSeq =
+            new java.util.concurrent.atomic.AtomicInteger(1);
+    private final java.util.concurrent.ExecutorService taskCallExecutor =
+            java.util.concurrent.Executors.newFixedThreadPool(2, r -> {
+                Thread t = new Thread(r, "MRSS-TaskCall-" + taskThreadSeq.getAndIncrement());
+                t.setDaemon(true);
+                return t;
+            });
+    private final java.util.List<MethodChannel.Result> pendingDpiCallbacks =
+            new java.util.ArrayList<>();
+    private final java.util.List<MethodChannel.Result> pendingRotationCallbacks =
+            new java.util.ArrayList<>();
     private final Shizuku.UserServiceArgs serviceArgs = 
         new Shizuku.UserServiceArgs(new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
             .daemon(false)
@@ -118,8 +155,28 @@ public class MainActivity extends FlutterActivity {
             taskService = null;
         }
     };
+
+    private final TaskServiceManager.BackendListener backendListener = (service, activeBackend, isReady) -> {
+        if (TaskServiceManager.BACKEND_LOCAL_ADB.equals(activeBackend)) {
+            taskService = service;
+        } else if (service != null) {
+            taskService = service;
+        }
+        if (methodChannel != null) {
+            runOnUiThread(() -> {
+                java.util.Map<String, Object> payload = new java.util.HashMap<>();
+                payload.put("backend", activeBackend);
+                payload.put("ready", isReady);
+                methodChannel.invokeMethod("onBackendStatusChanged", payload);
+            });
+        }
+    };
     
     private void bindTaskService() {
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            taskService = TaskServiceManager.getInstance(this).getLocalAdbBackend().getTaskService();
+            return;
+        }
         if (taskService != null) {
             return;
         }
@@ -147,22 +204,48 @@ public class MainActivity extends FlutterActivity {
         // 保存实例
         currentInstance = this;
         
+        TaskServiceManager.getInstance(this).addListener(backendListener);
+        
         // 添加Shizuku监听器（关键！使用Sticky版本）
         Shizuku.addBinderReceivedListenerSticky(binderReceivedListener);
         Shizuku.addBinderDeadListener(binderDeadListener);
         Shizuku.addRequestPermissionResultListener(requestPermissionResultListener);
         
-        // 自动检查并请求Shizuku权限
-        checkAndRequestShizukuPermission();
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            bindTaskService();
+        } else {
+            // 自动检查并请求Shizuku权限
+            checkAndRequestShizukuPermission();
+        }
         
         // 处理通知Intent
         handleIncomingIntent(getIntent());
     }
     
     @Override
+    protected void onResume() {
+        super.onResume();
+        mainActivityForeground = true;
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            bindTaskService();
+        }
+        TaskServiceManager.getInstance(this).broadcastCurrentStatus();
+    }
+
+    @Override
+    protected void onPause() {
+        mainActivityForeground = false;
+        super.onPause();
+    }
+
+    @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         handleIncomingIntent(intent);
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            bindTaskService();
+        }
+        TaskServiceManager.getInstance(this).broadcastCurrentStatus();
     }
     
     /**
@@ -196,62 +279,57 @@ public class MainActivity extends FlutterActivity {
         
         new Thread(() -> {
             try {
-                // 步骤1: 禁用官方Launcher
-                taskService.disableSubScreenLauncher();
-                
-                // 步骤2: 唤醒背屏
-                taskService.executeShellCommand("input -d 1 keyevent KEYCODE_WAKEUP");
-                Thread.sleep(50);
-                
-                // 步骤3: 在主屏启动Activity
+                // 步骤1: 安全校验包名
+                if (!com.tgwgroup.MiRearScreenSwitcher.adb.ShellCommandSanitizer.isValidPackageName(packageName)) {
+                    Log.e(TAG, "Invalid notification package name rejected: " + packageName);
+                    return;
+                }
+                // 步骤2: 在主屏显式启动占位Activity（避免HyperOS 4锁屏拦截，且不强杀SubScreenLauncher）
+                java.util.concurrent.CountDownLatch latch = RearScreenNotificationActivity.prepareForLaunch();
                 String componentName = getPackageName() + "/" + RearScreenNotificationActivity.class.getName();
                 String mainCmd = String.format(
-                    "am start -n %s --es packageName \"%s\" --es title \"%s\" --es text \"%s\" --el when %d",
-                    componentName, packageName,
-                    title != null ? title.replace("\"", "'") : "",
-                    text != null ? text.replace("\"", "'") : "",
+                    "am start --display 0 -n %s --es packageName %s --es title %s --es text %s --el when %d",
+                    componentName,
+                    com.tgwgroup.MiRearScreenSwitcher.adb.ShellCommandSanitizer.escapeShellSingleQuoted(packageName),
+                    com.tgwgroup.MiRearScreenSwitcher.adb.ShellCommandSanitizer.escapeShellSingleQuoted(title),
+                    com.tgwgroup.MiRearScreenSwitcher.adb.ShellCommandSanitizer.escapeShellSingleQuoted(text),
                     when
                 );
                 taskService.executeShellCommand(mainCmd);
-                
-                // 步骤4: 轮询获取taskId
-                String notifTaskId = null;
-                int attempts = 0;
-                int maxAttempts = 20;
-                
-                while (notifTaskId == null && attempts < maxAttempts) {
-                    Thread.sleep(30);
-                    String result = taskService.executeShellCommandWithResult("am stack list | grep RearScreenNotificationActivity");
-                    if (result != null && !result.trim().isEmpty()) {
-                        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("taskId=(\\d+)");
-                        java.util.regex.Matcher matcher = pattern.matcher(result);
-                        if (matcher.find()) {
-                            notifTaskId = matcher.group(1);
-                            Log.d(TAG, "Found notification taskId=" + notifTaskId);
-                            break;
+
+                // 步骤3: 优先通过静态taskId桥接获取taskId，回退am stack list
+                int notifTaskId = -1;
+                try {
+                    latch.await(1200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    notifTaskId = RearScreenNotificationActivity.getLastLaunchedTaskId();
+                } catch (InterruptedException ignored) {}
+
+                if (notifTaskId <= 0) {
+                    int attempts = 0;
+                    while (notifTaskId <= 0 && attempts < 20) {
+                        Thread.sleep(30);
+                        String result = taskService.executeShellCommandWithResult("am stack list | grep RearScreenNotificationActivity");
+                        if (result != null && !result.trim().isEmpty()) {
+                            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("taskId=(\\d+)");
+                            java.util.regex.Matcher matcher = pattern.matcher(result);
+                            if (matcher.find()) {
+                                notifTaskId = Integer.parseInt(matcher.group(1));
+                                break;
+                            }
                         }
+                        attempts++;
                     }
-                    attempts++;
                 }
-                
-                if (notifTaskId != null) {
-                    // 步骤5: 移动到背屏
-                    String moveCmd = "service call activity_task 50 i32 " + notifTaskId + " i32 1";
-                    taskService.executeShellCommand(moveCmd);
+
+                if (notifTaskId > 0) {
+                    // 步骤4: 移动到背屏并温和唤醒Display 1
+                    taskService.moveTaskToDisplay(notifTaskId, 1);
                     Thread.sleep(40);
-                    
-                    // 步骤6: 检查是否锁屏，决定是否关闭主屏
-                    android.app.KeyguardManager km = (android.app.KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
-                    if (km != null && km.isKeyguardLocked()) {
-                        // 主屏休眠功能已移除
-                        Log.d(TAG, "🔒 锁屏状态，主屏已关闭");
-                    }
-                    
-                    Log.d(TAG, "✅ Notification animation started on rear screen");
+                    taskService.executeShellCommand("input -d 1 keyevent 224");
+                    Log.d(TAG, "✅ Notification animation started on rear screen (taskId=" + notifTaskId + ")");
                 } else {
                     Log.e(TAG, "❌ Failed to find notification taskId");
                 }
-                
             } catch (Exception e) {
                 Log.e(TAG, "Failed to show notification on rear screen", e);
             }
@@ -272,6 +350,10 @@ public class MainActivity extends FlutterActivity {
     }
     
     private void checkAndRequestShizukuPermission() {
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            bindTaskService();
+            return;
+        }
         try {
             if (Shizuku.pingBinder()) {
                 if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
@@ -293,6 +375,7 @@ public class MainActivity extends FlutterActivity {
         // 清除静态实例
         currentInstance = null;
         
+        TaskServiceManager.getInstance(this).removeListener(backendListener);
         Shizuku.removeBinderReceivedListener(binderReceivedListener);
         Shizuku.removeBinderDeadListener(binderDeadListener);
         Shizuku.removeRequestPermissionResultListener(requestPermissionResultListener);
@@ -306,20 +389,47 @@ public class MainActivity extends FlutterActivity {
         methodChannel.setMethodCallHandler((call, result) -> {
                 switch (call.method) {
                     case "checkShizuku": {
-                        try {
-                            boolean isRunning = Shizuku.pingBinder();
-                            boolean hasPermission = Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED;
-                            result.success(isRunning && hasPermission);
-                        } catch (Exception e) {
-                            result.success(false);
+                        if (TaskServiceManager.isLocalAdbMode(this)) {
+                            TaskServiceManager manager = TaskServiceManager.getInstance(MainActivity.this);
+                            if (manager.isBackendReadyFast()) {
+                                bindTaskService();
+                                result.success(true);
+                                break;
+                            }
+                            if (manager.getLocalAdbBackend().isBootstrapInProgress()) {
+                                result.success(false);
+                                break;
+                            }
+                            taskCallExecutor.execute(() -> {
+                                boolean ready = manager.isCurrentBackendReady();
+                                if (ready) {
+                                    bindTaskService();
+                                }
+                                runOnUiThread(() -> result.success(ready));
+                            });
+                        } else {
+                            try {
+                                boolean isRunning = Shizuku.pingBinder();
+                                boolean hasPermission = isRunning && (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED);
+                                if (hasPermission) {
+                                    bindTaskService();
+                                }
+                                result.success(isRunning && hasPermission);
+                            } catch (Exception e) {
+                                result.success(false);
+                            }
                         }
                         break;
                     }
                     
                     case "requestShizukuPermission": {
                         try {
-                            Shizuku.requestPermission(0);
-                            result.success(null);
+                            if (TaskServiceManager.isLocalAdbMode(this)) {
+                                result.success(null);
+                            } else {
+                                Shizuku.requestPermission(0);
+                                result.success(null);
+                            }
                         } catch (Exception e) {
                             result.error("ERROR", e.getMessage(), null);
                         }
@@ -327,34 +437,186 @@ public class MainActivity extends FlutterActivity {
                     }
                     
                     case "getShizukuInfo": {
+                        new Thread(() -> {
+                            String info = TaskServiceManager.getInstance(MainActivity.this).getCurrentBackendDiagnosticInfo();
+                            runOnUiThread(() -> result.success(info));
+                        }).start();
+                        break;
+                    }
+
+                    case "getExecutionBackend": {
+                        result.success(TaskServiceManager.getInstance(this).getActiveBackendMode());
+                        break;
+                    }
+
+                    case "getBackendDetailedState": {
+                        new Thread(() -> {
+                            java.util.Map<String, Object> state =
+                                    TaskServiceManager.getInstance(MainActivity.this).getDetailedBackendState();
+                            runOnUiThread(() -> result.success(state));
+                        }).start();
+                        break;
+                    }
+
+                    case "startLocalAdbAutoActivation": {
                         try {
-                            boolean isRunning = Shizuku.pingBinder();
-                            boolean hasPermission = Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED;
-                            int uid = Shizuku.getUid();
-                            int version = Shizuku.getVersion();
-                            String info = "Running: " + isRunning + "\n" +
-                                         "Permission: " + hasPermission + "\n" +
-                                         "UID: " + uid + "\n" +
-                                         "Version: " + version;
-                            result.success(info);
+                            requestLocalNetworkPermissionIfAndroid17();
+                            com.tgwgroup.MiRearScreenSwitcher.adb.LocalAdbAutoPairAccessibilityService
+                                    .armAutoPairSession(this, true);
+                            boolean a11yEnabled = com.tgwgroup.MiRearScreenSwitcher.adb.LocalAdbAutoPairAccessibilityService
+                                    .isAccessibilityServiceEnabled(this);
+                            if (a11yEnabled) {
+                                com.tgwgroup.MiRearScreenSwitcher.adb.LocalAdbAutoPairAccessibilityService
+                                        .launchDeveloperOptions(this);
+                                result.success("LAUNCHED_DEV_OPTIONS");
+                            } else {
+                                Intent a11yIntent = new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                                a11yIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                                startActivity(a11yIntent);
+                                result.success("OPENED_ACCESSIBILITY_SETTINGS");
+                            }
                         } catch (Exception e) {
-                            result.success("Error: " + e.getMessage());
+                            result.error("ERROR", e.getMessage(), null);
+                        }
+                        break;
+                    }
+
+                    case "openDeveloperOptions": {
+                        try {
+                            com.tgwgroup.MiRearScreenSwitcher.adb.LocalAdbAutoPairAccessibilityService
+                                    .launchDeveloperOptions(this);
+                            result.success(true);
+                        } catch (Exception e) {
+                            result.error("ERROR", e.getMessage(), null);
+                        }
+                        break;
+                    }
+
+                    case "setExecutionBackend": {
+                        String backend = call.argument("backend");
+                        TaskServiceManager manager = TaskServiceManager.getInstance(this);
+                        manager.setActiveBackendMode(backend);
+                        taskService = null;
+                        if (manager.isLocalAdbMode()) {
+                            requestLocalNetworkPermissionIfAndroid17();
+                            bindTaskService();
+                        } else {
+                            checkAndRequestShizukuPermission();
+                        }
+                        result.success(manager.getActiveBackendMode());
+                        break;
+                    }
+
+                    case "connectLocalAdb": {
+                        Integer portArg = call.argument("port");
+                        final int targetPort = (portArg != null) ? portArg : 0;
+                        new Thread(() -> {
+                            com.tgwgroup.MiRearScreenSwitcher.adb.LocalAdbBackend adb =
+                                    TaskServiceManager.getInstance(MainActivity.this).getLocalAdbBackend();
+                            boolean ok = (targetPort > 0)
+                                    ? adb.connectToPort(targetPort, 3500)
+                                    : adb.tryAutoConnect(3500);
+                            if (ok) {
+                                bindTaskService();
+                            }
+                            runOnUiThread(() -> result.success(ok));
+                        }).start();
+                        break;
+                    }
+
+                    case "pairLocalAdb": {
+                        Integer portArg = call.argument("port");
+                        String codeArg = call.argument("code");
+                        final int pairingPort = (portArg != null) ? portArg : 0;
+                        final String pairingCode = (codeArg != null) ? codeArg : "";
+                        new Thread(() -> {
+                            try {
+                                com.tgwgroup.MiRearScreenSwitcher.adb.LocalAdbBackend adb =
+                                        TaskServiceManager.getInstance(MainActivity.this).getLocalAdbBackend();
+                                boolean ok = adb.pairAndConnect(pairingPort, pairingCode);
+                                if (ok) {
+                                    bindTaskService();
+                                }
+                                runOnUiThread(() -> result.success(ok));
+                            } catch (Exception e) {
+                                runOnUiThread(() -> result.error("PAIR_ERROR", e.getMessage(), null));
+                            }
+                        }).start();
+                        break;
+                    }
+
+                    case "startLocalAdbNotificationPairing": {
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                                        != PackageManager.PERMISSION_GRANTED) {
+                                    ActivityCompat.requestPermissions(this,
+                                            new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                                            NOTIFICATION_PERMISSION_REQUEST_CODE);
+                                }
+                            }
+                            Intent svcIntent = new Intent(this,
+                                    com.tgwgroup.MiRearScreenSwitcher.adb.LocalAdbPairingService.class);
+                            svcIntent.setAction(
+                                    com.tgwgroup.MiRearScreenSwitcher.adb.LocalAdbPairingService.ACTION_START_PAIRING);
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                startForegroundService(svcIntent);
+                            } else {
+                                startService(svcIntent);
+                            }
+                            result.success(true);
+                        } catch (Exception e) {
+                            result.error("ERROR", e.getMessage(), null);
+                        }
+                        break;
+                    }
+
+                    case "stopLocalAdbNotificationPairing": {
+                        try {
+                            Intent svcIntent = new Intent(this,
+                                    com.tgwgroup.MiRearScreenSwitcher.adb.LocalAdbPairingService.class);
+                            stopService(svcIntent);
+                            result.success(true);
+                        } catch (Exception e) {
+                            result.error("ERROR", e.getMessage(), null);
+                        }
+                        break;
+                    }
+
+                    case "openWirelessDebuggingSettings": {
+                        try {
+                            Intent intent = new Intent("android.settings.WIFI_ADB_SETTINGS");
+                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                            startActivity(intent);
+                            result.success(true);
+                        } catch (Exception e1) {
+                            try {
+                                Intent fallback = new Intent(android.provider.Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS);
+                                fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                                startActivity(fallback);
+                                result.success(true);
+                            } catch (Exception e2) {
+                                result.error("ERROR", e2.getMessage(), null);
+                            }
                         }
                         break;
                     }
                     
                     case "getCurrentApp": {
-                        if (taskService != null) {
+                        if (!TaskServiceManager.getInstance(this).isBackendReadyFast() || taskService == null) {
+                            result.success(null);
+                            break;
+                        }
+                        final ITaskService svc = taskService;
+                        taskCallExecutor.execute(() -> {
                             try {
-                                String currentApp = taskService.getCurrentForegroundApp();
-                                result.success(currentApp);
+                                String currentApp = svc.getCurrentForegroundApp();
+                                runOnUiThread(() -> result.success(currentApp));
                             } catch (Exception e) {
                                 Log.e(TAG, "TaskService error: " + e.getMessage(), e);
-                                result.success(null);
+                                runOnUiThread(() -> result.success(null));
                             }
-                        } else {
-                            result.success(null);
-                        }
+                        });
                         break;
                     }
                     
@@ -378,48 +640,83 @@ public class MainActivity extends FlutterActivity {
                     }
                     
                     case "getCurrentRearDpi": {
-                        if (taskService != null) {
+                        if (!TaskServiceManager.getInstance(this).isBackendReadyFast() || taskService == null) {
+                            result.error("NOT_READY", "Backend not connected", null);
+                            break;
+                        }
+                        synchronized (pendingDpiCallbacks) {
+                            pendingDpiCallbacks.add(result);
+                            if (pendingDpiCallbacks.size() > 1) {
+                                // Coalesce into the already in-flight DPI query
+                                break;
+                            }
+                        }
+                        final ITaskService svc = taskService;
+                        taskCallExecutor.execute(() -> {
+                            Integer dpiVal = null;
+                            String errMsg = null;
                             try {
-                                int dpi = taskService.getCurrentRearDpi();
-                                result.success(dpi);
+                                dpiVal = svc.getCurrentRearDpi();
                             } catch (Exception e) {
                                 Log.e(TAG, "Failed to get rear DPI", e);
-                                result.error("ERROR", e.getMessage(), null);
+                                errMsg = e.getMessage();
                             }
-                        } else {
-                            result.error("ERROR", "TaskService not available", null);
-                        }
+                            final Integer finalDpi = dpiVal;
+                            final String finalErr = errMsg;
+                            final java.util.List<MethodChannel.Result> callbacks;
+                            synchronized (pendingDpiCallbacks) {
+                                callbacks = new java.util.ArrayList<>(pendingDpiCallbacks);
+                                pendingDpiCallbacks.clear();
+                            }
+                            runOnUiThread(() -> {
+                                for (MethodChannel.Result cb : callbacks) {
+                                    try {
+                                        if (finalDpi != null) {
+                                            cb.success(finalDpi);
+                                        } else {
+                                            cb.error("ERROR", finalErr, null);
+                                        }
+                                    } catch (Throwable ignored) {}
+                                }
+                            });
+                        });
                         break;
                     }
                     
                     case "setRearDpi": {
-                        if (taskService != null) {
+                        if (!TaskServiceManager.getInstance(this).isBackendReadyFast() || taskService == null) {
+                            result.error("NOT_READY", "Backend not connected", null);
+                            break;
+                        }
+                        final int dpi = (int) call.argument("dpi");
+                        final ITaskService svc = taskService;
+                        taskCallExecutor.execute(() -> {
                             try {
-                                int dpi = (int) call.argument("dpi");
-                                boolean success = taskService.setRearDpi(dpi);
-                                result.success(success);
+                                boolean success = svc.setRearDpi(dpi);
+                                runOnUiThread(() -> result.success(success));
                             } catch (Exception e) {
                                 Log.e(TAG, "Failed to set rear DPI", e);
-                                result.error("ERROR", e.getMessage(), null);
+                                runOnUiThread(() -> result.error("ERROR", e.getMessage(), null));
                             }
-                        } else {
-                            result.error("ERROR", "TaskService not available", null);
-                        }
+                        });
                         break;
                     }
                     
                     case "resetRearDpi": {
-                        if (taskService != null) {
+                        if (!TaskServiceManager.getInstance(this).isBackendReadyFast() || taskService == null) {
+                            result.error("NOT_READY", "Backend not connected", null);
+                            break;
+                        }
+                        final ITaskService svc = taskService;
+                        taskCallExecutor.execute(() -> {
                             try {
-                                boolean success = taskService.resetRearDpi();
-                                result.success(success);
+                                boolean success = svc.resetRearDpi();
+                                runOnUiThread(() -> result.success(success));
                             } catch (Exception e) {
                                 Log.e(TAG, "Failed to reset rear DPI", e);
-                                result.error("ERROR", e.getMessage(), null);
+                                runOnUiThread(() -> result.error("ERROR", e.getMessage(), null));
                             }
-                        } else {
-                            result.error("ERROR", "TaskService not available", null);
-                        }
+                        });
                         break;
                     }
                     
@@ -499,13 +796,13 @@ public class MainActivity extends FlutterActivity {
                     }
                     
                     case "ensureTaskServiceConnected": {
-                        // 确保TaskService连接正常
+                        // 确保TaskService连接正常（不阻塞UI线程）
                         try {
                             if (taskService == null) {
-                                // 尝试重新绑定
                                 bindTaskService();
                             }
-                            result.success(taskService != null);
+                            boolean ready = TaskServiceManager.getInstance(this).isBackendReadyFast();
+                            result.success(ready);
                         } catch (Exception e) {
                             Log.e(TAG, "Failed to ensure TaskService connection", e);
                             result.error("ERROR", e.getMessage(), null);
@@ -514,73 +811,97 @@ public class MainActivity extends FlutterActivity {
                     }
                     
                     case "setDisplayRotation": {
-                        if (taskService != null) {
-                            try {
-                                int displayId = (int) call.argument("displayId");
-                                int rotation = (int) call.argument("rotation");
-                                boolean success = taskService.setDisplayRotation(displayId, rotation);
-                                result.success(success);
-                            } catch (Exception e) {
-                                result.error("ERROR", e.getMessage(), null);
-                            }
-                        } else {
-                            result.error("ERROR", "TaskService not available", null);
+                        if (!TaskServiceManager.getInstance(this).isBackendReadyFast() || taskService == null) {
+                            result.error("NOT_READY", "Backend not connected", null);
+                            break;
                         }
+                        final int displayId = (int) call.argument("displayId");
+                        final int rotation = (int) call.argument("rotation");
+                        final ITaskService svc = taskService;
+                        taskCallExecutor.execute(() -> {
+                            try {
+                                boolean success = svc.setDisplayRotation(displayId, rotation);
+                                runOnUiThread(() -> result.success(success));
+                            } catch (Exception e) {
+                                runOnUiThread(() -> result.error("ERROR", e.getMessage(), null));
+                            }
+                        });
                         break;
                     }
                     
                     case "getDisplayRotation": {
-                        if (taskService != null) {
-                            try {
-                                int displayId = (int) call.argument("displayId");
-                                int rotation = taskService.getDisplayRotation(displayId);
-                                result.success(rotation);
-                            } catch (Exception e) {
-                                result.error("ERROR", e.getMessage(), null);
-                            }
-                        } else {
-                            result.error("ERROR", "TaskService not available", null);
+                        if (!TaskServiceManager.getInstance(this).isBackendReadyFast() || taskService == null) {
+                            result.error("NOT_READY", "Backend not connected", null);
+                            break;
                         }
+                        synchronized (pendingRotationCallbacks) {
+                            pendingRotationCallbacks.add(result);
+                            if (pendingRotationCallbacks.size() > 1) {
+                                // Coalesce into the already in-flight rotation query
+                                break;
+                            }
+                        }
+                        final int displayId = (int) call.argument("displayId");
+                        final ITaskService svc = taskService;
+                        taskCallExecutor.execute(() -> {
+                            Integer rotVal = null;
+                            String errMsg = null;
+                            try {
+                                rotVal = svc.getDisplayRotation(displayId);
+                            } catch (Exception e) {
+                                errMsg = e.getMessage();
+                            }
+                            final Integer finalRot = rotVal;
+                            final String finalErr = errMsg;
+                            final java.util.List<MethodChannel.Result> callbacks;
+                            synchronized (pendingRotationCallbacks) {
+                                callbacks = new java.util.ArrayList<>(pendingRotationCallbacks);
+                                pendingRotationCallbacks.clear();
+                            }
+                            runOnUiThread(() -> {
+                                for (MethodChannel.Result cb : callbacks) {
+                                    try {
+                                        if (finalRot != null) {
+                                            cb.success(finalRot);
+                                        } else {
+                                            cb.error("ERROR", finalErr, null);
+                                        }
+                                    } catch (Throwable ignored) {}
+                                }
+                            });
+                        });
                         break;
                     }
                     
                     case "returnRearAppAndRestart": {
-                        // 重启前先拉回背屏应用
-                        if (taskService != null) {
+                        // 重启前先拉回背屏应用（在后台线程执行，防止阻塞主线程）
+                        if (!TaskServiceManager.getInstance(this).isBackendReadyFast() || taskService == null) {
+                            result.success(false);
+                            break;
+                        }
+                        final ITaskService svc = taskService;
+                        taskCallExecutor.execute(() -> {
                             try {
-                                // 获取最后移动的任务信息
                                 String lastTask = SwitchToRearTileService.getLastMovedTask();
-                                
                                 if (lastTask != null && lastTask.contains(":")) {
                                     String[] parts = lastTask.split(":");
                                     int taskId = Integer.parseInt(parts[1]);
-                                    
-                                    // 检查任务是否还在背屏
-                                    boolean onRear = taskService.isTaskOnDisplay(taskId, 1);
-                                    
+                                    boolean onRear = svc.isTaskOnDisplay(taskId, 1);
                                     if (onRear) {
-                                        // 拉回主屏
-                                        taskService.moveTaskToDisplay(taskId, 0);
-                                        
-                                        // 恢复官方Launcher
-                                        taskService.enableSubScreenLauncher();
-                                        
-                                        result.success(true);
+                                        svc.moveTaskToDisplay(taskId, 0);
+                                        svc.enableSubScreenLauncher();
+                                        runOnUiThread(() -> result.success(true));
                                     } else {
-                                        // 没有应用在背屏
-                                        result.success(false);
+                                        runOnUiThread(() -> result.success(false));
                                     }
                                 } else {
-                                    // 没有记录
-                                    result.success(false);
+                                    runOnUiThread(() -> result.success(false));
                                 }
                             } catch (Exception e) {
                                 Log.e(TAG, "Failed to return rear app", e);
-                                result.error("ERROR", e.getMessage(), null);
+                                runOnUiThread(() -> result.error("ERROR", e.getMessage(), null));
                             }
-                        } else {
-                            result.error("ERROR", "TaskService not available", null);
-                        }
+                        });
                         break;
                     }
                     
@@ -914,6 +1235,65 @@ public class MainActivity extends FlutterActivity {
                             result.success(true);
                         } catch (Exception e) {
                             Log.e(TAG, "Failed to set notification duration", e);
+                            result.error("ERROR", e.getMessage(), null);
+                        }
+                        break;
+                    }
+
+                    case "setMediaAlbumBlur": {
+                        // V3.7: 背屏媒体组件专辑封面模糊度 (0..50 px)
+                        try {
+                            Number blurArg = call.argument("blur");
+                            float clampedBlur = (blurArg != null)
+                                    ? RearMediaShadeController.clampAlbumBlur(blurArg.floatValue())
+                                    : RearMediaShadeController.DEFAULT_ALBUM_BLUR;
+
+                            SharedPreferences prefs = getSharedPreferences("mrss_settings", MODE_PRIVATE);
+                            prefs.edit()
+                                    .putFloat(RearMediaShadeController.PREF_MEDIA_ALBUM_BLUR, clampedBlur)
+                                    .apply();
+
+                            RearMediaActivity.updateAlbumBlurIfActive(clampedBlur);
+                            Log.d(TAG, "Media album blur set to: " + clampedBlur);
+                            result.success(true);
+                        } catch (Exception e) {
+                            Log.e(TAG, "Failed to save media album blur", e);
+                            result.error("ERROR", e.getMessage(), null);
+                        }
+                        break;
+                    }
+
+                    case "setMediaPillSettings": {
+                        // V3.7: 背屏顶部媒体胶囊自定义设置（开关 / 缩放 1.0x-5.0x / 液态玻璃配色）
+                        try {
+                            Boolean enabledArg = call.argument("enabled");
+                            Number scaleArg = call.argument("scale");
+                            Number colorArg = call.argument("color");
+
+                            SharedPreferences prefs = getSharedPreferences("mrss_settings", MODE_PRIVATE);
+                            SharedPreferences.Editor editor = prefs.edit();
+                            if (enabledArg != null) {
+                                editor.putBoolean("media_pill_enabled", enabledArg);
+                            }
+                            if (scaleArg != null) {
+                                float clampedScale = RearSurfacePillRenderer.clampScale(scaleArg.floatValue());
+                                editor.putFloat("media_pill_scale", clampedScale);
+                            }
+                            if (colorArg != null) {
+                                editor.putInt("media_pill_color", colorArg.intValue());
+                            }
+                            editor.apply();
+
+                            Intent reloadIntent = new Intent("com.tgwgroup.MiRearScreenSwitcher.RELOAD_NOTIFICATION_SETTINGS");
+                            reloadIntent.setPackage(getPackageName());
+                            sendBroadcast(reloadIntent);
+
+                            Log.d(TAG, "Media pill settings updated: enabled=" + enabledArg
+                                    + ", scale=" + scaleArg + ", color="
+                                    + (colorArg != null ? String.format("0x%08X", colorArg.intValue()) : "unchanged"));
+                            result.success(true);
+                        } catch (Exception e) {
+                            Log.e(TAG, "Failed to save media pill settings", e);
                             result.error("ERROR", e.getMessage(), null);
                         }
                         break;

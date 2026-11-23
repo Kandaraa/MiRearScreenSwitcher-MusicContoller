@@ -113,6 +113,13 @@ class _HomePageState extends State<HomePage> {
   // Status Enum
   ShizukuStatus _shizukuStatus = ShizukuStatus.checking;
   bool _shizukuRunning = false;
+  bool _checkShizukuInFlight = false;
+  bool _dpiQueryInFlight = false;
+  bool _rotationQueryInFlight = false;
+  Timer? _backendStatusDebounceTimer;
+  String _executionBackend = 'shizuku'; // 'shizuku' or 'local_adb'
+  String _localAdbStateCode = 'NEEDS_PAIRING'; // 'READY', 'WAITING_FOR_WIFI', 'NEEDS_PAIRING'
+  bool _adbBusy = false;
   // String _statusMessage = 'Checking Shizuku...'; // Removed
   String _customErrorTitle = ''; // For specific error types
   bool _isLoading = false;
@@ -149,6 +156,23 @@ class _HomePageState extends State<HomePage> {
   // V3.6: Smart Media Rear Controller
   bool _smartMediaEnabled = false; // Default disabled
 
+  // V3.7: Media Pull Pill & Album Blur Customization (appears when _smartMediaEnabled is true)
+  double _mediaAlbumBlur = 20.0; // 0.0 .. 50.0 px (0% .. 100%, step 5%)
+  bool _mediaPillEnabled = true;
+  double _mediaPillScale = 3.0; // 1.0x .. 5.0x (step 0.5)
+  int _mediaPillColor = 0xFFD60A0A; // Default crimson liquid glass
+
+  static const List<int> _mediaPillColorPresets = [
+    0xFFD60A0A, // Crimson (default)
+    0xFF06B6D4, // Cyan
+    0xFF3B82F6, // Sapphire
+    0xFF8B5CF6, // Violet
+    0xFF10B981, // Emerald
+    0xFFF59E0B, // Amber
+    0xFFEC4899, // Rose
+    0xFFE2E8F0, // Frost White
+  ];
+
   @override
   void initState() {
     super.initState();
@@ -161,13 +185,16 @@ class _HomePageState extends State<HomePage> {
 
     // 延迟获取DPI和旋转，等待TaskService连接
     Future.delayed(const Duration(seconds: 2), () {
-      _getCurrentRearDpi();
-      _getCurrentRotation();
+      if (_shizukuRunning) {
+        _getCurrentRearDpi();
+        _getCurrentRotation();
+      }
     });
   }
 
   @override
   void dispose() {
+    _backendStatusDebounceTimer?.cancel();
     _dpiController.dispose();
     _dpiFocusNode.dispose();
     super.dispose();
@@ -178,14 +205,40 @@ class _HomePageState extends State<HomePage> {
       if (call.method == 'onShizukuPermissionChanged') {
         final granted = call.arguments as bool;
         print('Shizuku permission changed: $granted');
-        // 刷新状态
+        final bool wasReady = _shizukuRunning;
         await _checkShizuku();
 
-        // Shizuku授权完成后，立即请求通知权限
         if (granted) {
           print('✓ Shizuku已授权，立即请求通知权限');
           _requestNotificationPermission();
         }
+        if (!wasReady && _shizukuRunning) {
+          _getCurrentRearDpi();
+          _getCurrentRotation();
+        }
+      } else if (call.method == 'onBackendStatusChanged') {
+        final dynamic args = call.arguments;
+        if (args is Map) {
+          final String? evtBackend = args['backend']?.toString();
+          final bool evtReady = args['ready'] == true;
+          // Ignore duplicate status broadcasts that do not change readiness or backend mode
+          if (_shizukuStatus != ShizukuStatus.checking &&
+              _shizukuRunning == evtReady &&
+              (evtBackend == null || evtBackend == _executionBackend)) {
+            return;
+          }
+        }
+        _backendStatusDebounceTimer?.cancel();
+        _backendStatusDebounceTimer = Timer(const Duration(milliseconds: 250), () async {
+          if (!mounted) return;
+          final bool wasReady = _shizukuRunning;
+          await _checkShizuku();
+          // Only trigger DPI/rotation reload when backend readiness transitions from false -> true
+          if (!wasReady && _shizukuRunning) {
+            _getCurrentRearDpi();
+            _getCurrentRotation();
+          }
+        });
       }
     });
   }
@@ -202,35 +255,50 @@ class _HomePageState extends State<HomePage> {
 
   // V15: 获取当前背屏DPI
   Future<void> _getCurrentRearDpi() async {
-    setState(() {
-      _dpiLoading = true;
-    });
-
-    // 最多重试5次，每次间隔1秒
-    for (int i = 0; i < 5; i++) {
-      try {
-        final int dpi = await platform.invokeMethod('getCurrentRearDpi');
-        setState(() {
-          _currentRearDpi = dpi;
-          _dpiController.text = dpi.toString();
-          _dpiLoading = false;
-        });
-        print('当前背屏DPI: $dpi');
-        return; // 成功就退出
-      } catch (e) {
-        print('获取背屏DPI失败 (尝试 ${i + 1}/5): $e');
-        if (i < 4) {
-          await Future.delayed(const Duration(seconds: 1));
-        }
-      }
+    if (_dpiQueryInFlight || !_shizukuRunning) return;
+    _dpiQueryInFlight = true;
+    if (mounted) {
+      setState(() {
+        _dpiLoading = true;
+      });
     }
 
-    // 所有重试都失败
-    setState(() {
-      _dpiLoading = false;
-      _currentRearDpi = 0;
-    });
-    print('获取背屏DPI最终失败');
+    try {
+      // 最多重试3次，若后端未就绪则立即退出
+      for (int i = 0; i < 3; i++) {
+        if (!mounted || !_shizukuRunning) break;
+        try {
+          final int dpi = await platform.invokeMethod('getCurrentRearDpi');
+          if (mounted) {
+            setState(() {
+              _currentRearDpi = dpi;
+              _dpiController.text = dpi.toString();
+              _dpiLoading = false;
+            });
+          }
+          print('当前背屏DPI: $dpi');
+          return; // 成功就退出
+        } catch (e) {
+          print('获取背屏DPI失败 (尝试 ${i + 1}/3): $e');
+          if (e.toString().contains('NOT_READY') || e.toString().contains('fail-fast')) {
+            break;
+          }
+          if (i < 2) {
+            await Future.delayed(const Duration(seconds: 1));
+          }
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _dpiLoading = false;
+          _currentRearDpi = 0;
+        });
+      }
+      print('获取背屏DPI最终失败');
+    } finally {
+      _dpiQueryInFlight = false;
+    }
   }
 
   // V15: 设置背屏DPI
@@ -328,17 +396,45 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _checkShizuku() async {
-    setState(() {
-      _shizukuStatus = ShizukuStatus.checking;
-      _hasError = false;
-      _errorDetail = '';
-    });
+    if (_checkShizukuInFlight) return;
+    _checkShizukuInFlight = true;
+    if (!_shizukuRunning) {
+      setState(() {
+        _shizukuStatus = ShizukuStatus.checking;
+        _hasError = false;
+        _errorDetail = '';
+      });
+    }
 
     try {
+      try {
+        final String? backend = await platform.invokeMethod('getExecutionBackend');
+        if (backend != null && backend.isNotEmpty) {
+          _executionBackend = backend;
+        }
+        final dynamic detailed = await platform.invokeMethod('getBackendDetailedState');
+        if (detailed is Map) {
+          final String? sc = detailed['stateCode']?.toString();
+          if (sc != null && sc.isNotEmpty) {
+            _localAdbStateCode = sc;
+          }
+        }
+      } catch (_) {}
+
       // 简化检查：直接调用Java层，增加超时
       final result = await platform
           .invokeMethod('checkShizuku')
-          .timeout(const Duration(seconds: 3));
+          .timeout(const Duration(seconds: 4));
+
+      try {
+        final dynamic detailedAfter = await platform.invokeMethod('getBackendDetailedState');
+        if (detailedAfter is Map) {
+          final String? sc = detailedAfter['stateCode']?.toString();
+          if (sc != null && sc.isNotEmpty) {
+            _localAdbStateCode = sc;
+          }
+        }
+      } catch (_) {}
 
       if (!mounted) return;
 
@@ -349,17 +445,21 @@ class _HomePageState extends State<HomePage> {
 
         if (_shizukuRunning) {
           _shizukuStatus = ShizukuStatus.running;
-
-          // Shizuku已授权，立即请求通知权限
-          print('✓ Shizuku已授权，立即请求通知权限');
+          _localAdbStateCode = 'READY';
           _requestNotificationPermission();
         } else {
           _hasError = true;
           _shizukuStatus = ShizukuStatus.error;
-          _customErrorTitle = ''; // Use default "Permission Required"
-          _errorDetail = AppLocalizations.of(
-            context,
-          ).translate('shizuku_permission_denied');
+          _customErrorTitle = _executionBackend == 'local_adb'
+              ? AppLocalizations.of(context).translate(
+                  _localAdbStateCode == 'WAITING_FOR_WIFI'
+                      ? 'local_adb_waiting_wifi'
+                      : 'local_adb_not_connected',
+                )
+              : '';
+          _errorDetail = _executionBackend == 'local_adb'
+              ? AppLocalizations.of(context).translate('local_adb_setup_guide')
+              : AppLocalizations.of(context).translate('shizuku_permission_denied');
           // 获取详细信息帮助诊断
           _getDetailedStatus();
         }
@@ -412,6 +512,8 @@ class _HomePageState extends State<HomePage> {
         _shizukuStatus = ShizukuStatus.error;
         _customErrorTitle = errorType;
       });
+    } finally {
+      _checkShizukuInFlight = false;
     }
   }
 
@@ -475,8 +577,20 @@ class _HomePageState extends State<HomePage> {
             false; // V2.4: 加载背屏通知开关状态
         _smartMediaEnabled =
             prefs.getBool('smart_media_enabled') ??
-            false; // Smart Media Rear Controller 
+            false; // Smart Media Rear Controller
+        _mediaAlbumBlur =
+            (prefs.getDouble('media_album_blur') ?? 20.0).clamp(0.0, 50.0);
+        _mediaPillEnabled = prefs.getBool('media_pill_enabled') ?? true;
+        _mediaPillScale =
+            (prefs.getDouble('media_pill_scale') ?? 3.0).clamp(1.0, 5.0);
+        _mediaPillColor = prefs.getInt('media_pill_color') ?? 0xFFD60A0A;
+        _executionBackend =
+            prefs.getString('execution_backend') ?? 'shizuku';
       });
+
+      // Sync persisted media shade & pill customization to native mrss_settings
+      _syncMediaAlbumBlurToNative();
+      _syncMediaPillSettingsToNative();
 
       // 启动充电服务（如果开关打开）
       if (_chargingAnimationEnabled) {
@@ -763,6 +877,10 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _smartMediaEnabled = enabled;
       });
+      if (enabled) {
+        await _syncMediaAlbumBlurToNative();
+        await _syncMediaPillSettingsToNative();
+      }
       print('Smart Media Controller turned ${enabled ? "ON" : "OFF"}');
     } catch (e) {
       print('Failed to toggle Smart Media Controller: $e');
@@ -772,13 +890,594 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<void> _syncMediaAlbumBlurToNative() async {
+    try {
+      await platform.invokeMethod('setMediaAlbumBlur', {
+        'blur': _mediaAlbumBlur,
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _updateMediaAlbumBlur(
+    double blur, {
+    bool syncNative = true,
+  }) async {
+    final double snapped = ((blur / 2.5).round() * 2.5).clamp(0.0, 50.0);
+    setState(() {
+      _mediaAlbumBlur = snapped;
+    });
+
+    if (!syncNative) return;
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble('media_album_blur', snapped);
+      await platform.invokeMethod('setMediaAlbumBlur', {
+        'blur': snapped,
+      });
+    } catch (_) {}
+  }
+
+  Widget _buildAlbumBlurPreview() {
+    // Map native 0..50px radius to preview sigma (scaled proportionally for compact preview card)
+    final double previewSigma = _mediaAlbumBlur * 0.32;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(14),
+      child: Container(
+        height: 66,
+        width: double.infinity,
+        decoration: BoxDecoration(
+          border: Border.all(color: Colors.white.withValues(alpha: 0.16)),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            // Stylized colorful album cover art blurred at the selected intensity
+            ImageFiltered(
+              imageFilter: ImageFilter.blur(
+                sigmaX: previewSigma,
+                sigmaY: previewSigma,
+                tileMode: TileMode.clamp,
+              ),
+              child: CustomPaint(
+                painter: _AlbumArtBlurPreviewPainter(),
+              ),
+            ),
+            // Same dark top-to-bottom vignette scrim used in RearMediaShadeController
+            DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Colors.black.withValues(alpha: 0.35),
+                    Colors.black.withValues(alpha: 0.55),
+                    Colors.black.withValues(alpha: 0.72),
+                  ],
+                ),
+              ),
+            ),
+            // Mini rear media widget silhouette (title + progress + controls)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Container(
+                          width: 96,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.92),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Container(
+                          width: 58,
+                          height: 5,
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.62),
+                            borderRadius: BorderRadius.circular(3),
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(2),
+                          child: SizedBox(
+                            height: 3,
+                            child: Stack(
+                              children: [
+                                Container(
+                                  color: Colors.white.withValues(alpha: 0.25),
+                                ),
+                                FractionallySizedBox(
+                                  widthFactor: 0.58,
+                                  child: Container(
+                                    color: Colors.white.withValues(alpha: 0.9),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  Icon(
+                    Icons.skip_previous_rounded,
+                    size: 18,
+                    color: Colors.white.withValues(alpha: 0.85),
+                  ),
+                  const SizedBox(width: 8),
+                  Container(
+                    width: 28,
+                    height: 28,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Colors.white.withValues(alpha: 0.24),
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.35),
+                      ),
+                    ),
+                    child: const Icon(
+                      Icons.pause_rounded,
+                      size: 16,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Icon(
+                    Icons.skip_next_rounded,
+                    size: 18,
+                    color: Colors.white.withValues(alpha: 0.85),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _syncMediaPillSettingsToNative() async {
+    try {
+      await platform.invokeMethod('setMediaPillSettings', {
+        'enabled': _mediaPillEnabled,
+        'scale': _mediaPillScale,
+        'color': _mediaPillColor,
+      });
+    } catch (e) {
+      print('Failed syncing media pill settings: $e');
+    }
+  }
+
+  Future<void> _updateMediaPillSettings({
+    bool? enabled,
+    double? scale,
+    int? color,
+    bool syncNative = true,
+  }) async {
+    final nextEnabled = enabled ?? _mediaPillEnabled;
+    final nextScale = ((scale ?? _mediaPillScale) * 2).round() / 2.0;
+    final clampedScale = nextScale.clamp(1.0, 5.0);
+    final nextColor = color ?? _mediaPillColor;
+
+    setState(() {
+      _mediaPillEnabled = nextEnabled;
+      _mediaPillScale = clampedScale;
+      _mediaPillColor = nextColor;
+    });
+
+    if (!syncNative) return;
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('media_pill_enabled', nextEnabled);
+      await prefs.setDouble('media_pill_scale', clampedScale);
+      await prefs.setInt('media_pill_color', nextColor);
+
+      await platform.invokeMethod('setMediaPillSettings', {
+        'enabled': nextEnabled,
+        'scale': clampedScale,
+        'color': nextColor,
+      });
+    } catch (e) {
+      print('Failed updating media pill settings: $e');
+    }
+  }
+
+  Color _derivePreviewGlassFill(int tintArgb) {
+    if ((tintArgb & 0x00FFFFFF) == 0x00D60A0A) {
+      return const Color(0x3DBF4545);
+    }
+    final r0 = (tintArgb >> 16) & 0xFF;
+    final g0 = (tintArgb >> 8) & 0xFF;
+    final b0 = tintArgb & 0xFF;
+    final r = ((r0 * 0.78) + (115 * 0.22)).round().clamp(0, 255);
+    final g = ((g0 * 0.78) + (115 * 0.22)).round().clamp(0, 255);
+    final b = ((b0 * 0.78) + (115 * 0.22)).round().clamp(0, 255);
+    return Color.fromARGB(0x3D, r, g, b);
+  }
+
+  Widget _buildMediaPillPreview() {
+    final baseRgb = _mediaPillColor & 0x00FFFFFF;
+    final strokeTop = Color(0xC8000000 | baseRgb);
+    final strokeBottom = Color(0x34000000 | baseRgb);
+    final fillColor = _derivePreviewGlassFill(_mediaPillColor);
+
+    // Visual preview scale mapped gently (1.0x..5.0x -> 1.1x..1.85x in UI card)
+    final double previewScale = 1.05 + ((_mediaPillScale - 1.0) / 4.0) * 0.80;
+    final double w = 100.0 * previewScale;
+    final double h = 24.0 * previewScale;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(vertical: 14),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.82),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.14)),
+      ),
+      child: Center(
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          curve: Curves.easeOutCubic,
+          width: w,
+          height: h,
+          child: CustomPaint(
+            painter: _MediaPillPreviewPainter(
+              fillColor: fillColor,
+              strokeTopColor: strokeTop,
+              strokeBottomColor: strokeBottom,
+              scale: previewScale,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _switchExecutionBackend(String backend) async {
+    if (_executionBackend == backend && !_hasError) return;
+    setState(() {
+      _executionBackend = backend;
+      _shizukuStatus = ShizukuStatus.checking;
+    });
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('execution_backend', backend);
+      await platform.invokeMethod('setExecutionBackend', {'backend': backend});
+      await _checkShizuku();
+      if (_shizukuRunning) {
+        _getCurrentRearDpi();
+        _getCurrentRotation();
+      }
+    } catch (e) {
+      print('Failed switching backend: $e');
+    }
+  }
+
+  Future<void> _autoConnectLocalAdb({int? port}) async {
+    if (_adbBusy) return;
+    setState(() => _adbBusy = true);
+    try {
+      final bool ok = await platform.invokeMethod('connectLocalAdb', {
+        if (port != null) 'port': port,
+      }) ?? false;
+      await _checkShizuku();
+      if (ok) {
+        _getCurrentRearDpi();
+        _getCurrentRotation();
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              AppLocalizations.of(context).translate(
+                ok ? 'toast_adb_connected' : 'toast_adb_connect_failed',
+              ),
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('$e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _adbBusy = false);
+      }
+    }
+  }
+
+  Future<void> _showAutoActivateChecklistDialog() async {
+    await showDialog(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: Text(
+            AppLocalizations.of(context).translate('auto_activate_dialog_title'),
+            style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  AppLocalizations.of(context).translate('auto_activate_prereq_intro'),
+                  style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  AppLocalizations.of(context).translate('auto_activate_prereq_1'),
+                  style: const TextStyle(fontSize: 13, height: 1.4),
+                ),
+                Text(
+                  AppLocalizations.of(context).translate('auto_activate_prereq_2'),
+                  style: const TextStyle(fontSize: 13, height: 1.4),
+                ),
+                Text(
+                  AppLocalizations.of(context).translate('auto_activate_prereq_3'),
+                  style: const TextStyle(fontSize: 13, height: 1.4),
+                ),
+                Text(
+                  AppLocalizations.of(context).translate('auto_activate_prereq_4'),
+                  style: const TextStyle(fontSize: 13, height: 1.4),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  AppLocalizations.of(context).translate('auto_activate_how_it_works'),
+                  style: const TextStyle(fontSize: 12, color: Colors.black54, height: 1.35),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                platform.invokeMethod('openDeveloperOptions');
+              },
+              child: Text(AppLocalizations.of(context).translate('btn_open_dev_options')),
+            ),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.auto_fix_high_rounded, size: 18),
+              label: Text(AppLocalizations.of(context).translate('btn_start_auto_activate')),
+              onPressed: () async {
+                Navigator.of(ctx).pop();
+                try {
+                  final String? action = await platform.invokeMethod('startLocalAdbAutoActivation');
+                  if (mounted && action == 'OPENED_ACCESSIBILITY_SETTINGS') {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        duration: const Duration(seconds: 6),
+                        content: Text(
+                          AppLocalizations.of(context).translate('toast_auto_activate_a11y'),
+                        ),
+                      ),
+                    );
+                  }
+                } catch (e) {
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('$e')),
+                    );
+                  }
+                }
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _startNotificationPairing() async {
+    try {
+      await platform.invokeMethod('startLocalAdbNotificationPairing');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            duration: const Duration(seconds: 5),
+            content: Text(
+              AppLocalizations.of(context).translate('notif_pair_started_toast'),
+            ),
+          ),
+        );
+      }
+      await platform.invokeMethod('openWirelessDebuggingSettings');
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('$e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _showManualAdbDialog() async {
+    final pairingPortCtrl = TextEditingController();
+    final pairingCodeCtrl = TextEditingController();
+    final connectPortCtrl = TextEditingController();
+
+    await showDialog(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: Text(
+            AppLocalizations.of(context).translate('manual_pair_dialog_title'),
+            style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: pairingPortCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(
+                    labelText: AppLocalizations.of(context).translate('pairing_port_label'),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: pairingCodeCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(
+                    labelText: AppLocalizations.of(context).translate('pairing_code_label'),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.link, size: 18),
+                    label: Text(AppLocalizations.of(context).translate('btn_pair_now')),
+                    onPressed: () async {
+                      final pPort = int.tryParse(pairingPortCtrl.text.trim()) ?? 0;
+                      final pCode = pairingCodeCtrl.text.trim();
+                      if (pPort <= 0 || pCode.isEmpty) return;
+                      Navigator.of(ctx).pop();
+                      setState(() => _adbBusy = true);
+                      try {
+                        final bool ok = await platform.invokeMethod('pairLocalAdb', {
+                          'port': pPort,
+                          'code': pCode,
+                        }) ?? false;
+                        await _checkShizuku();
+                        if (ok) {
+                          _getCurrentRearDpi();
+                          _getCurrentRotation();
+                        }
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                AppLocalizations.of(context).translate(
+                                  ok ? 'toast_adb_connected' : 'toast_adb_connect_failed',
+                                ),
+                              ),
+                            ),
+                          );
+                        }
+                      } catch (e) {
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text('$e')),
+                          );
+                        }
+                      } finally {
+                        if (mounted) setState(() => _adbBusy = false);
+                      }
+                    },
+                  ),
+                ),
+                const Divider(height: 24),
+                TextField(
+                  controller: connectPortCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: InputDecoration(
+                    labelText: AppLocalizations.of(context).translate('connect_port_label'),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    icon: const Icon(Icons.bolt, size: 18),
+                    label: Text(AppLocalizations.of(context).translate('btn_connect_port')),
+                    onPressed: () {
+                      final cPort = int.tryParse(connectPortCtrl.text.trim());
+                      Navigator.of(ctx).pop();
+                      _autoConnectLocalAdb(port: cPort);
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: Text(AppLocalizations.of(context).translate('cancel')),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildBackendOptionPill(String backendKey, String label, IconData icon) {
+    final bool selected = _executionBackend == backendKey;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => _switchExecutionBackend(backendKey),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 12),
+          decoration: BoxDecoration(
+            color: selected ? Colors.white.withOpacity(0.55) : Colors.black.withOpacity(0.06),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: selected ? Colors.white : Colors.transparent,
+              width: 1.2,
+            ),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                size: 18,
+                color: selected ? Colors.black87 : Colors.black54,
+              ),
+              const SizedBox(width: 6),
+              Flexible(
+                child: Text(
+                  label,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: selected ? FontWeight.bold : FontWeight.w500,
+                    color: selected ? Colors.black87 : Colors.black54,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   String _getDisplayStatus(BuildContext context) {
+    final bool isLocalAdb = _executionBackend == 'local_adb';
     switch (_shizukuStatus) {
       case ShizukuStatus.checking:
-        return AppLocalizations.of(context).translate('check_shizuku');
+        return AppLocalizations.of(context).translate(
+          isLocalAdb ? 'check_local_adb' : 'check_shizuku',
+        );
       case ShizukuStatus.running:
-        return AppLocalizations.of(context).translate('status_ready');
+        return AppLocalizations.of(context).translate(
+          isLocalAdb ? 'local_adb_ready' : 'status_ready',
+        );
       case ShizukuStatus.error:
+        if (isLocalAdb) {
+          if (_localAdbStateCode == 'WAITING_FOR_WIFI') {
+            return AppLocalizations.of(context).translate('local_adb_waiting_wifi');
+          }
+          return AppLocalizations.of(context).translate('local_adb_not_connected');
+        }
         return _customErrorTitle.isNotEmpty
             ? _customErrorTitle
             : AppLocalizations.of(context).translate('permission_required');
@@ -850,33 +1549,76 @@ class _HomePageState extends State<HomePage> {
                         padding: const EdgeInsets.all(16),
                         child: Column(
                           children: [
+                            // Dual-Backend Segmented Switcher (Shizuku vs Local ADB)
+                            Row(
+                              children: [
+                                _buildBackendOptionPill(
+                                  'shizuku',
+                                  AppLocalizations.of(context).translate('backend_shizuku'),
+                                  Icons.security_rounded,
+                                ),
+                                const SizedBox(width: 10),
+                                _buildBackendOptionPill(
+                                  'local_adb',
+                                  AppLocalizations.of(context).translate('backend_local_adb'),
+                                  Icons.terminal_rounded,
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 14),
                             Row(
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
-                                Icon(
-                                  _shizukuRunning
-                                      ? Icons.check_circle
-                                      : (_hasError
-                                            ? Icons.error_outline
-                                            : Icons.warning_rounded),
-                                  size: 28,
-                                  color: _shizukuRunning
-                                      ? Colors.green
-                                      : (_hasError
-                                            ? Colors.red
-                                            : Colors.orange),
-                                ),
+                                if (_adbBusy || _shizukuStatus == ShizukuStatus.checking) ...[
+                                  const SizedBox(
+                                    width: 22,
+                                    height: 22,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2.2,
+                                      valueColor: AlwaysStoppedAnimation<Color>(Colors.black87),
+                                    ),
+                                  ),
+                                ] else ...[
+                                  Icon(
+                                    _shizukuRunning
+                                        ? Icons.check_circle
+                                        : (_hasError
+                                              ? Icons.error_outline
+                                              : Icons.warning_rounded),
+                                    size: 28,
+                                    color: _shizukuRunning
+                                        ? Colors.green
+                                        : (_hasError
+                                              ? Colors.red
+                                              : Colors.orange),
+                                  ),
+                                ],
                                 const SizedBox(width: 10),
-                                Text(
-                                  _getDisplayStatus(context),
-                                  style: const TextStyle(
-                                    fontSize: 16,
-                                    color: Colors.black87,
-                                    fontWeight: FontWeight.w500,
+                                Flexible(
+                                  child: Text(
+                                    _getDisplayStatus(context),
+                                    style: const TextStyle(
+                                      fontSize: 16,
+                                      color: Colors.black87,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                    textAlign: TextAlign.center,
                                   ),
                                 ),
                               ],
                             ),
+                            if (_executionBackend == 'local_adb' && !_shizukuRunning) ...[
+                              const SizedBox(height: 8),
+                              Text(
+                                AppLocalizations.of(context).translate('local_adb_setup_guide'),
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.black87,
+                                  height: 1.35,
+                                ),
+                                textAlign: TextAlign.center,
+                              ),
+                            ],
                             if (_hasError && _errorDetail.isNotEmpty) ...[
                               const SizedBox(height: 8),
                               Text(
@@ -887,6 +1629,90 @@ class _HomePageState extends State<HomePage> {
                                   height: 1.3,
                                 ),
                                 textAlign: TextAlign.center,
+                              ),
+                            ],
+                            if (_executionBackend == 'local_adb') ...[
+                              const SizedBox(height: 12),
+                              if (!_shizukuRunning) ...[
+                                SizedBox(
+                                  width: double.infinity,
+                                  child: ElevatedButton.icon(
+                                    onPressed: _adbBusy ? null : _showAutoActivateChecklistDialog,
+                                    icon: const Icon(Icons.auto_fix_high_rounded, size: 18),
+                                    label: Text(
+                                      AppLocalizations.of(context).translate('btn_auto_activate'),
+                                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+                                    ),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.white.withOpacity(0.9),
+                                      foregroundColor: Colors.black87,
+                                      elevation: 0,
+                                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                              ],
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                alignment: WrapAlignment.center,
+                                children: [
+                                  ElevatedButton.icon(
+                                    onPressed: _adbBusy ? null : _startNotificationPairing,
+                                    icon: const Icon(Icons.notifications_active_outlined, size: 16),
+                                    label: Text(
+                                      AppLocalizations.of(context).translate('btn_notif_pair'),
+                                      style: const TextStyle(fontSize: 12),
+                                    ),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.white.withOpacity(0.75),
+                                      foregroundColor: Colors.black87,
+                                      elevation: 0,
+                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                    ),
+                                  ),
+                                  ElevatedButton.icon(
+                                    onPressed: _adbBusy ? null : () => _autoConnectLocalAdb(),
+                                    icon: const Icon(Icons.flash_on_rounded, size: 16),
+                                    label: Text(
+                                      AppLocalizations.of(context).translate('btn_auto_connect'),
+                                      style: const TextStyle(fontSize: 12),
+                                    ),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.white.withOpacity(0.75),
+                                      foregroundColor: Colors.black87,
+                                      elevation: 0,
+                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                    ),
+                                  ),
+                                  OutlinedButton.icon(
+                                    onPressed: _adbBusy ? null : _showManualAdbDialog,
+                                    icon: const Icon(Icons.tune_rounded, size: 16),
+                                    label: Text(
+                                      AppLocalizations.of(context).translate('btn_manual_pair'),
+                                      style: const TextStyle(fontSize: 12),
+                                    ),
+                                    style: OutlinedButton.styleFrom(
+                                      foregroundColor: Colors.black87,
+                                      side: const BorderSide(color: Colors.black26),
+                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                    ),
+                                  ),
+                                  OutlinedButton.icon(
+                                    onPressed: () => platform.invokeMethod('openWirelessDebuggingSettings'),
+                                    icon: const Icon(Icons.developer_mode_rounded, size: 16),
+                                    label: Text(
+                                      AppLocalizations.of(context).translate('btn_wireless_settings'),
+                                      style: const TextStyle(fontSize: 12),
+                                    ),
+                                    style: OutlinedButton.styleFrom(
+                                      foregroundColor: Colors.black87,
+                                      side: const BorderSide(color: Colors.black26),
+                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                    ),
+                                  ),
+                                ],
                               ),
                             ],
                           ],
@@ -1540,20 +2366,514 @@ class _HomePageState extends State<HomePage> {
                             children: [
                               Row(
                                 children: [
-                                  Text(
-                                    AppLocalizations.of(context).translate('🎼 Smart media widget') ?? 'Smart media rear controller',
-                                    style: TextStyle(
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.bold,
-                                      color: Colors.black87,
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          AppLocalizations.of(context).translate('smart_media_title'),
+                                          style: const TextStyle(
+                                            fontSize: 16,
+                                            fontWeight: FontWeight.bold,
+                                            color: Colors.black87,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 2),
+                                        Text(
+                                          AppLocalizations.of(context).translate('smart_media_subtitle'),
+                                          style: const TextStyle(
+                                            fontSize: 12,
+                                            color: Colors.black54,
+                                          ),
+                                        ),
+                                      ],
                                     ),
                                   ),
-                                  const Spacer(),
+                                  const SizedBox(width: 12),
                                   _GradientToggle(
                                     value: _smartMediaEnabled,
                                     onChanged: _toggleSmartMedia,
                                   ),
                                 ],
+                              ),
+                              // V3.7: Rear Media Shade Customization (follows Rear Media Shade toggle)
+                              AnimatedSize(
+                                duration: const Duration(milliseconds: 240),
+                                curve: Curves.easeOutCubic,
+                                child: _smartMediaEnabled
+                                    ? Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          const SizedBox(height: 14),
+                                          Divider(
+                                            height: 1,
+                                            color: Colors.black
+                                                .withValues(alpha: 0.08),
+                                          ),
+                                          const SizedBox(height: 14),
+                                          // Album Art Blur customization (directly under Rear Media Shade)
+                                          Row(
+                                            children: [
+                                              Expanded(
+                                                child: Text(
+                                                  AppLocalizations.of(context)
+                                                      .translate(
+                                                        'media_album_blur_title',
+                                                      ),
+                                                  style: const TextStyle(
+                                                    fontSize: 14,
+                                                    fontWeight: FontWeight.w600,
+                                                    color: Colors.black87,
+                                                  ),
+                                                ),
+                                              ),
+                                              Container(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                      horizontal: 8,
+                                                      vertical: 2,
+                                                    ),
+                                                decoration: BoxDecoration(
+                                                  color: Colors.black
+                                                      .withValues(alpha: 0.08),
+                                                  borderRadius:
+                                                      BorderRadius.circular(8),
+                                                ),
+                                                child: Text(
+                                                  _mediaAlbumBlur <= 0.1
+                                                      ? AppLocalizations.of(
+                                                          context,
+                                                        ).translate(
+                                                          'media_album_blur_off',
+                                                        )
+                                                      : '${(_mediaAlbumBlur / 50.0 * 100).round()}%',
+                                                  style: const TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.bold,
+                                                    color: Colors.black87,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                          const SizedBox(height: 10),
+                                          _buildAlbumBlurPreview(),
+                                          SliderTheme(
+                                            data: SliderTheme.of(
+                                              context,
+                                            ).copyWith(
+                                              activeTrackColor: const Color(
+                                                0xFF6366F1,
+                                              ),
+                                              inactiveTrackColor: Colors.black
+                                                  .withValues(alpha: 0.12),
+                                              thumbColor: Colors.white,
+                                              overlayColor: const Color(
+                                                0x266366F1,
+                                              ),
+                                              trackHeight: 4,
+                                            ),
+                                            child: Slider(
+                                              value: _mediaAlbumBlur,
+                                              min: 0.0,
+                                              max: 50.0,
+                                              divisions: 20,
+                                              label: _mediaAlbumBlur <= 0.1
+                                                  ? AppLocalizations.of(
+                                                      context,
+                                                    ).translate(
+                                                      'media_album_blur_off',
+                                                    )
+                                                  : '${(_mediaAlbumBlur / 50.0 * 100).round()}%',
+                                              onChanged: (val) =>
+                                                  _updateMediaAlbumBlur(
+                                                    val,
+                                                    syncNative: false,
+                                                  ),
+                                              onChangeEnd: (val) =>
+                                                  _updateMediaAlbumBlur(
+                                                    val,
+                                                    syncNative: true,
+                                                  ),
+                                            ),
+                                          ),
+                                          const SizedBox(height: 6),
+                                          Divider(
+                                            height: 1,
+                                            color: Colors.black
+                                                .withValues(alpha: 0.08),
+                                          ),
+                                          const SizedBox(height: 14),
+                                          // 1. Pill On/Off toggle
+                                          Row(
+                                            children: [
+                                              Expanded(
+                                                child: Text(
+                                                  AppLocalizations.of(context)
+                                                      .translate(
+                                                        'media_pill_toggle_title',
+                                                      ),
+                                                  style: const TextStyle(
+                                                    fontSize: 14,
+                                                    fontWeight: FontWeight.w600,
+                                                    color: Colors.black87,
+                                                  ),
+                                                ),
+                                              ),
+                                              _GradientToggle(
+                                                value: _mediaPillEnabled,
+                                                onChanged: (val) =>
+                                                    _updateMediaPillSettings(
+                                                      enabled: val,
+                                                    ),
+                                              ),
+                                            ],
+                                          ),
+                                          const SizedBox(height: 12),
+                                          IgnorePointer(
+                                            ignoring: !_mediaPillEnabled,
+                                            child: AnimatedOpacity(
+                                              duration: const Duration(
+                                                milliseconds: 180,
+                                              ),
+                                              opacity:
+                                                  _mediaPillEnabled ? 1.0 : 0.42,
+                                              child: Column(
+                                                crossAxisAlignment:
+                                                    CrossAxisAlignment.start,
+                                                children: [
+                                                  _buildMediaPillPreview(),
+                                                  const SizedBox(height: 14),
+                                                  // 2. Pill Size (x1.0 to x5.0, step 0.5)
+                                                  Row(
+                                                    children: [
+                                                      Text(
+                                                        AppLocalizations.of(
+                                                          context,
+                                                        ).translate(
+                                                          'media_pill_size_title',
+                                                        ),
+                                                        style: const TextStyle(
+                                                          fontSize: 13,
+                                                          fontWeight:
+                                                              FontWeight.w600,
+                                                          color: Colors.black87,
+                                                        ),
+                                                      ),
+                                                      const Spacer(),
+                                                      Container(
+                                                        padding:
+                                                            const EdgeInsets.symmetric(
+                                                              horizontal: 8,
+                                                              vertical: 2,
+                                                            ),
+                                                        decoration:
+                                                            BoxDecoration(
+                                                              color: Colors.black
+                                                                  .withValues(
+                                                                    alpha: 0.08,
+                                                                  ),
+                                                              borderRadius:
+                                                                  BorderRadius.circular(
+                                                                    8,
+                                                                  ),
+                                                            ),
+                                                        child: Text(
+                                                          'x${_mediaPillScale.toStringAsFixed(1)}',
+                                                          style: const TextStyle(
+                                                            fontSize: 12,
+                                                            fontWeight:
+                                                                FontWeight.bold,
+                                                            color:
+                                                                Colors.black87,
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                  SliderTheme(
+                                                    data: SliderTheme.of(
+                                                      context,
+                                                    ).copyWith(
+                                                      activeTrackColor: Color(
+                                                        0xFF000000 |
+                                                            (_mediaPillColor &
+                                                                0x00FFFFFF),
+                                                      ),
+                                                      inactiveTrackColor: Colors
+                                                          .black
+                                                          .withValues(
+                                                            alpha: 0.12,
+                                                          ),
+                                                      thumbColor: Colors.white,
+                                                      overlayColor: Color(
+                                                        0x26000000 |
+                                                            (_mediaPillColor &
+                                                                0x00FFFFFF),
+                                                      ),
+                                                      trackHeight: 4,
+                                                    ),
+                                                    child: Slider(
+                                                      value: _mediaPillScale,
+                                                      min: 1.0,
+                                                      max: 5.0,
+                                                      divisions: 8,
+                                                      label:
+                                                          'x${_mediaPillScale.toStringAsFixed(1)}',
+                                                      onChanged: (val) =>
+                                                          _updateMediaPillSettings(
+                                                            scale: val,
+                                                            syncNative: false,
+                                                          ),
+                                                      onChangeEnd: (val) =>
+                                                          _updateMediaPillSettings(
+                                                            scale: val,
+                                                            syncNative: true,
+                                                          ),
+                                                    ),
+                                                  ),
+                                                  const SizedBox(height: 6),
+                                                  // 3. Overall Liquid Glass Color
+                                                  Row(
+                                                    children: [
+                                                      Text(
+                                                        AppLocalizations.of(
+                                                          context,
+                                                        ).translate(
+                                                          'media_pill_color_title',
+                                                        ),
+                                                        style: const TextStyle(
+                                                          fontSize: 13,
+                                                          fontWeight:
+                                                              FontWeight.w600,
+                                                          color: Colors.black87,
+                                                        ),
+                                                      ),
+                                                      const Spacer(),
+                                                      Text(
+                                                        '#${(_mediaPillColor & 0x00FFFFFF).toRadixString(16).padLeft(6, '0').toUpperCase()}',
+                                                        style: const TextStyle(
+                                                          fontSize: 11,
+                                                          fontFamily:
+                                                              'monospace',
+                                                          color: Colors.black54,
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                  const SizedBox(height: 10),
+                                                  Wrap(
+                                                    spacing: 10,
+                                                    runSpacing: 10,
+                                                    children:
+                                                        _mediaPillColorPresets
+                                                            .map((preset) {
+                                                              final bool
+                                                              selected =
+                                                                  (_mediaPillColor &
+                                                                      0x00FFFFFF) ==
+                                                                  (preset &
+                                                                      0x00FFFFFF);
+                                                              return GestureDetector(
+                                                                onTap: () =>
+                                                                    _updateMediaPillSettings(
+                                                                      color:
+                                                                          preset,
+                                                                    ),
+                                                                child: AnimatedContainer(
+                                                                  duration:
+                                                                      const Duration(
+                                                                        milliseconds:
+                                                                            140,
+                                                                      ),
+                                                                  width: 28,
+                                                                  height: 28,
+                                                                  decoration: BoxDecoration(
+                                                                    shape:
+                                                                        BoxShape
+                                                                            .circle,
+                                                                    color: Color(
+                                                                      preset,
+                                                                    ),
+                                                                    border: Border.all(
+                                                                      color: selected
+                                                                          ? Colors
+                                                                              .black87
+                                                                          : Colors
+                                                                              .white
+                                                                              .withValues(
+                                                                                alpha:
+                                                                                    0.85,
+                                                                              ),
+                                                                      width:
+                                                                          selected
+                                                                          ? 2.5
+                                                                          : 1.5,
+                                                                    ),
+                                                                    boxShadow: [
+                                                                      BoxShadow(
+                                                                        color: Color(
+                                                                          preset,
+                                                                        ).withValues(
+                                                                          alpha:
+                                                                              0.35,
+                                                                        ),
+                                                                        blurRadius:
+                                                                            selected
+                                                                            ? 8
+                                                                            : 3,
+                                                                        spreadRadius:
+                                                                            selected
+                                                                            ? 1
+                                                                            : 0,
+                                                                      ),
+                                                                    ],
+                                                                  ),
+                                                                  child: selected
+                                                                      ? Icon(
+                                                                          Icons
+                                                                              .check,
+                                                                          size:
+                                                                              15,
+                                                                          color:
+                                                                              preset ==
+                                                                                  0xFFE2E8F0
+                                                                              ? Colors
+                                                                                  .black87
+                                                                              : Colors
+                                                                                  .white,
+                                                                        )
+                                                                      : null,
+                                                                ),
+                                                              );
+                                                            })
+                                                            .toList(),
+                                                  ),
+                                                  const SizedBox(height: 10),
+                                                  // Continuous 360-degree Hue bar for custom glass tint
+                                                  SizedBox(
+                                                    height: 26,
+                                                    child: Stack(
+                                                      alignment:
+                                                          Alignment.center,
+                                                      children: [
+                                                        Container(
+                                                          height: 8,
+                                                          margin:
+                                                              const EdgeInsets.symmetric(
+                                                                horizontal: 12,
+                                                              ),
+                                                          decoration: BoxDecoration(
+                                                            borderRadius:
+                                                                BorderRadius.circular(
+                                                                  4,
+                                                                ),
+                                                            gradient: const LinearGradient(
+                                                              colors: [
+                                                                Color(
+                                                                  0xFFFF0000,
+                                                                ),
+                                                                Color(
+                                                                  0xFFFFFF00,
+                                                                ),
+                                                                Color(
+                                                                  0xFF00FF00,
+                                                                ),
+                                                                Color(
+                                                                  0xFF00FFFF,
+                                                                ),
+                                                                Color(
+                                                                  0xFF0000FF,
+                                                                ),
+                                                                Color(
+                                                                  0xFFFF00FF,
+                                                                ),
+                                                                Color(
+                                                                  0xFFFF0000,
+                                                                ),
+                                                              ],
+                                                            ),
+                                                          ),
+                                                        ),
+                                                        SliderTheme(
+                                                          data: SliderTheme.of(
+                                                            context,
+                                                          ).copyWith(
+                                                            activeTrackColor:
+                                                                Colors
+                                                                    .transparent,
+                                                            inactiveTrackColor:
+                                                                Colors
+                                                                    .transparent,
+                                                            thumbColor: Color(
+                                                              0xFF000000 |
+                                                                  (_mediaPillColor &
+                                                                      0x00FFFFFF),
+                                                            ),
+                                                            overlayColor: Colors
+                                                                .black
+                                                                .withValues(
+                                                                  alpha: 0.08,
+                                                                ),
+                                                            thumbShape:
+                                                                const RoundSliderThumbShape(
+                                                                  enabledThumbRadius:
+                                                                      9,
+                                                                ),
+                                                          ),
+                                                          child: Slider(
+                                                            value: HSVColor.fromColor(
+                                                              Color(
+                                                                0xFF000000 |
+                                                                    (_mediaPillColor &
+                                                                        0x00FFFFFF),
+                                                              ),
+                                                            ).hue,
+                                                            min: 0.0,
+                                                            max: 360.0,
+                                                            onChanged: (hue) {
+                                                              final c =
+                                                                  HSVColor.fromAHSV(
+                                                                    1.0,
+                                                                    hue,
+                                                                    0.90,
+                                                                    0.88,
+                                                                  ).toColor();
+                                                              _updateMediaPillSettings(
+                                                                color:
+                                                                    c.toARGB32(),
+                                                                syncNative:
+                                                                    false,
+                                                              );
+                                                            },
+                                                            onChangeEnd: (hue) {
+                                                              final c =
+                                                                  HSVColor.fromAHSV(
+                                                                    1.0,
+                                                                    hue,
+                                                                    0.90,
+                                                                    0.88,
+                                                                  ).toColor();
+                                                              _updateMediaPillSettings(
+                                                                color:
+                                                                    c.toARGB32(),
+                                                                syncNative:
+                                                                    true,
+                                                              );
+                                                            },
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      )
+                                    : const SizedBox.shrink(),
                               ),
                             ],
                           ),
@@ -2048,17 +3368,21 @@ class _HomePageState extends State<HomePage> {
 
   // V2.1: 获取当前旋转方向
   Future<void> _getCurrentRotation() async {
+    if (_rotationQueryInFlight || !_shizukuRunning) return;
+    _rotationQueryInFlight = true;
     try {
       final rotation = await platform.invokeMethod('getDisplayRotation', {
         'displayId': 1,
       });
-      if (rotation != null && rotation >= 0) {
+      if (mounted && rotation != null && rotation >= 0) {
         setState(() {
           _currentRotation = rotation;
         });
       }
     } catch (e) {
       print('获取旋转方向失败: $e');
+    } finally {
+      _rotationQueryInFlight = false;
     }
   }
 
@@ -3837,4 +5161,168 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
       ),
     );
   }
+}
+
+class _MediaPillPreviewPainter extends CustomPainter {
+  final Color fillColor;
+  final Color strokeTopColor;
+  final Color strokeBottomColor;
+  final double scale;
+
+  const _MediaPillPreviewPainter({
+    required this.fillColor,
+    required this.strokeTopColor,
+    required this.strokeBottomColor,
+    required this.scale,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final s = scale;
+    final inset = 1.25 * s;
+    final corner = Radius.circular(11.0 * s);
+    final capsuleRect = Rect.fromLTRB(
+      inset,
+      inset,
+      size.width - inset,
+      size.height - inset,
+    );
+    final capsuleRRect = RRect.fromRectAndRadius(capsuleRect, corner);
+
+    // 1. Base liquid-glass fill
+    final fillPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = fillColor;
+    canvas.drawRRect(capsuleRRect, fillPaint);
+
+    // 2. Top specular glass sheen
+    final sheenPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: const [
+          Color(0x24FFFFFF),
+          Color(0x05FFFFFF),
+          Color(0x2E000000),
+        ],
+        stops: const [0.0, 0.45, 1.0],
+      ).createShader(Rect.fromLTRB(0, inset, size.width, size.height));
+    canvas.drawRRect(capsuleRRect, sheenPaint);
+
+    // 3. Directional top-lit rim stroke
+    final strokePaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.5 * s
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [strokeTopColor, strokeBottomColor],
+      ).createShader(capsuleRect);
+    canvas.drawRRect(capsuleRRect, strokePaint);
+
+    // 4. 3-bar mini equalizer (playing reference heights {6, 9, 5})
+    const refHeights = [6.0, 9.0, 5.0];
+    final eqPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = const Color(0xFF05FF44);
+    final centerY = 12.0 * s;
+    final barCorner = Radius.circular(1.0 * s);
+    for (int i = 0; i < 3; i++) {
+      final left = (12.0 + i * 3.5) * s;
+      final halfH = (refHeights[i] * s) * 0.5;
+      final barRect = Rect.fromLTRB(
+        left,
+        centerY - halfH,
+        left + 2.0 * s,
+        centerY + halfH,
+      );
+      canvas.drawRRect(RRect.fromRectAndRadius(barRect, barCorner), eqPaint);
+    }
+
+    // 5. Grab bar
+    final grabPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = const Color(0xD6FFFFFF);
+    final grabRect = Rect.fromLTRB(
+      31.5 * s,
+      10.5 * s,
+      82.5 * s,
+      13.5 * s,
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(grabRect, Radius.circular(1.5 * s)),
+      grabPaint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _MediaPillPreviewPainter oldDelegate) {
+    return oldDelegate.fillColor != fillColor ||
+        oldDelegate.strokeTopColor != strokeTopColor ||
+        oldDelegate.strokeBottomColor != strokeBottomColor ||
+        oldDelegate.scale != scale;
+  }
+}
+
+class _AlbumArtBlurPreviewPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Offset.zero & size;
+    final bgPaint = Paint()
+      ..shader = const LinearGradient(
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+        colors: [
+          Color(0xFF1E1B4B),
+          Color(0xFF7C3AED),
+          Color(0xFFEC4899),
+          Color(0xFFF59E0B),
+        ],
+        stops: [0.0, 0.38, 0.72, 1.0],
+      ).createShader(rect);
+    canvas.drawRect(rect, bgPaint);
+
+    // Crisp geometric artwork accents so blur differences (0% -> 100%) are immediately visible
+    canvas.drawCircle(
+      Offset(size.width * 0.22, size.height * 0.35),
+      size.height * 0.34,
+      Paint()..color = const Color(0xFF38BDF8),
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromCenter(
+          center: Offset(size.width * 0.54, size.height * 0.56),
+          width: size.height * 0.62,
+          height: size.height * 0.62,
+        ),
+        const Radius.circular(8),
+      ),
+      Paint()..color = const Color(0xFFFDE047),
+    );
+    canvas.drawCircle(
+      Offset(size.width * 0.80, size.height * 0.28),
+      size.height * 0.26,
+      Paint()..color = const Color(0xFF34D399),
+    );
+    // Crisp high-contrast rings & diagonal bar to make 0% sharpness unmistakable
+    canvas.drawCircle(
+      Offset(size.width * 0.22, size.height * 0.35),
+      size.height * 0.16,
+      Paint()
+        ..color = Colors.white
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.5,
+    );
+    canvas.drawLine(
+      Offset(size.width * 0.42, size.height * 0.15),
+      Offset(size.width * 0.68, size.height * 0.85),
+      Paint()
+        ..color = const Color(0xFF0F172A)
+        ..strokeWidth = 3.5,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _AlbumArtBlurPreviewPainter oldDelegate) => false;
 }
