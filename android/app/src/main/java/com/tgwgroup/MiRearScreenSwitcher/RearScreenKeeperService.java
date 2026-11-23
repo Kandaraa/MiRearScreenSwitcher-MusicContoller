@@ -115,6 +115,14 @@ public class RearScreenKeeperService extends Service implements SensorEventListe
         }
     }
 
+    private final android.content.BroadcastReceiver backendChangedReceiver = new android.content.BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            taskService = null;
+            bindTaskService();
+        }
+    };
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -128,6 +136,13 @@ public class RearScreenKeeperService extends Service implements SensorEventListe
 
         // V2.2: 从SharedPreferences恢复传感器开关状态
         loadProximitySensorSetting();
+
+        android.content.IntentFilter filter = new android.content.IntentFilter(TaskServiceManager.ACTION_BACKEND_CHANGED);
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(backendChangedReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(backendChangedReceiver, filter);
+        }
     }
 
     @Override
@@ -446,9 +461,13 @@ public class RearScreenKeeperService extends Service implements SensorEventListe
     };
 
     /**
-     * 绑定Shizuku TaskService
+     * 绑定Shizuku / Local ADB TaskService
      */
     private void bindTaskService() {
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            taskService = TaskServiceManager.getInstance(this).getLocalAdbBackend().getTaskService();
+            return;
+        }
         if (taskService != null) {
             return;
         }
@@ -471,6 +490,13 @@ public class RearScreenKeeperService extends Service implements SensorEventListe
      * 解绑TaskService
      */
     private void unbindTaskService() {
+        try {
+            unregisterReceiver(backendChangedReceiver);
+        } catch (Exception ignored) {}
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            taskService = null;
+            return;
+        }
         if (taskService != null) {
             try {
                 Shizuku.unbindUserService(
@@ -481,7 +507,7 @@ public class RearScreenKeeperService extends Service implements SensorEventListe
                                 .debuggable(false)
                                 .version(1),
                         taskServiceConnection,
-                        true);
+                        false);
             } catch (Exception e) {
                 Log.w(TAG, "Failed to unbind TaskService", e);
             }

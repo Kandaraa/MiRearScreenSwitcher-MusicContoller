@@ -24,9 +24,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
 
-    kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_11.toString()
-    }
+
 
     defaultConfig {
         applicationId = "com.tgwgroup.MiRearScreenSwitcher"
@@ -77,6 +75,12 @@ android {
     
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
+    }
+}
+
 flutter {
     source = "../.."
 }
@@ -85,4 +89,6 @@ dependencies {
     // Shizuku API
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+    // Conscrypt (Apache-2.0) for public TLS 1.3 RFC 5705 exportKeyingMaterial on Android 11-17
+    implementation("org.conscrypt:conscrypt-android:2.5.3")
 }

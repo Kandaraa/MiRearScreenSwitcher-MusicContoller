@@ -128,6 +128,11 @@ public class ScreenRecordService extends Service {
     }
     
     private void bindTaskService() {
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            taskService = TaskServiceManager.getInstance(this).getLocalAdbBackend().getTaskService();
+            Log.d(TAG, "✓ TaskService connected (Local ADB)");
+            return;
+        }
         if (taskService != null) {
             Log.d(TAG, "TaskService已连接，跳过绑定");
             return;
@@ -719,10 +724,12 @@ public class ScreenRecordService extends Service {
         
         // 解绑TaskService
         if (taskService != null) {
-            try {
-                Shizuku.unbindUserService(serviceArgs, taskServiceConnection, true);
-            } catch (Exception e) {
-                Log.e(TAG, "解绑TaskService失败", e);
+            if (!TaskServiceManager.isLocalAdbMode(this)) {
+                try {
+                    Shizuku.unbindUserService(serviceArgs, taskServiceConnection, false);
+                } catch (Exception e) {
+                    Log.e(TAG, "解绑TaskService失败", e);
+                }
             }
             taskService = null;
         }

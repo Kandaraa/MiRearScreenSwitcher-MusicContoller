@@ -28,6 +28,13 @@
 # Services and Activities
 -keep class com.tgwgroup.MiRearScreenSwitcher.MainActivity { *; }
 -keep class com.tgwgroup.MiRearScreenSwitcher.MyApplication { *; }
+-keep class com.tgwgroup.MiRearScreenSwitcher.TaskServiceManager { *; }
+-keep class com.tgwgroup.MiRearScreenSwitcher.adb.** { *; }
+-keepclassmembers class com.tgwgroup.MiRearScreenSwitcher.adb.MrssShellDaemon {
+    public static void main(java.lang.String[]);
+}
+-keep class org.conscrypt.** { *; }
+-dontwarn org.conscrypt.**
 -keep class com.tgwgroup.MiRearScreenSwitcher.**Service { *; }
 -keep class com.tgwgroup.MiRearScreenSwitcher.**Activity { *; }
 -keep class com.tgwgroup.MiRearScreenSwitcher.**Receiver { *; }

@@ -132,5 +132,18 @@ interface ITaskService {
      */
     boolean executeShellCommand(String cmd) = 20;
     String executeShellCommandWithResult(String cmd) = 21;
+
+    /**
+     * V3.7: 启动/停止 UID 2000 背屏原生下拉手势监听器（用于 Shizuku 模式；Local ADB 模式优先走 MrssShellDaemon 独立流连接）
+     */
+    boolean startRearPullDownWatcher() = 22;
+    boolean stopRearPullDownWatcher() = 23;
+
+    /**
+     * V3.7: UID 2000 SurfaceControl 背屏顶部媒体胶囊控制
+     */
+    void showRearMediaPill(boolean isPlaying, int x, int y) = 24;
+    void hideRearMediaPill() = 25;
+    void showRearMediaPillStyled(boolean isPlaying, int x, int y, float scale, int tintColor) = 26;
 }
 

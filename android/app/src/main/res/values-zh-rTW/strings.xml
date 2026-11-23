@@ -19,4 +19,6 @@
     <string name="notif_running_on_rear">正在背屏運行</string>
     <string name="notif_click_to_return">點擊將 %s 切換回主屏</string>
     <string name="notif_mrss_running">MRSS目前正在運行</string>
+    <string name="accessibility_auto_pair_label">MRSS 內置ADB一鍵自動配對</string>
+    <string name="accessibility_auto_pair_desc">僅在點擊「一鍵自動激活」時用於自動讀取無線調試6位配對碼，配對完成後會立即自動關閉。</string>
 </resources>

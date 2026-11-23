@@ -16,12 +16,57 @@ package com.tgwgroup.MiRearScreenSwitcher;
 
 import android.util.Log;
 
+import java.util.concurrent.CopyOnWriteArrayList;
+
 /**
  * 背屏动画管理器
  * 统一管理充电动画和通知动画，实现动画打断机制
  */
 public class RearAnimationManager {
     private static final String TAG = "RearAnimationManager";
+
+    /**
+     * 动画状态监听器（用于背屏灵动媒体等原生悬浮层在通知/充电动画期间主动让位并在结束后恢复）
+     */
+    public interface OnAnimationStateListener {
+        void onAnimationStarted(AnimationType type);
+        void onAnimationEnded(AnimationType type);
+    }
+
+    private static final CopyOnWriteArrayList<OnAnimationStateListener> stateListeners =
+            new CopyOnWriteArrayList<>();
+
+    public static void addAnimationStateListener(OnAnimationStateListener listener) {
+        if (listener != null && !stateListeners.contains(listener)) {
+            stateListeners.add(listener);
+        }
+    }
+
+    public static void removeAnimationStateListener(OnAnimationStateListener listener) {
+        if (listener != null) {
+            stateListeners.remove(listener);
+        }
+    }
+
+    private static void notifyAnimationStarted(AnimationType type) {
+        for (OnAnimationStateListener listener : stateListeners) {
+            try {
+                listener.onAnimationStarted(type);
+            } catch (Throwable t) {
+                Log.w(TAG, "Animation start listener error: " + t.getMessage());
+            }
+        }
+    }
+
+    private static void notifyAnimationEnded(AnimationType type) {
+        for (OnAnimationStateListener listener : stateListeners) {
+            try {
+                listener.onAnimationEnded(type);
+            } catch (Throwable t) {
+                Log.w(TAG, "Animation end listener error: " + t.getMessage());
+            }
+        }
+    }
     
     // 动画类型
     public enum AnimationType {
@@ -63,6 +108,7 @@ public class RearAnimationManager {
         // 设置新动画为当前动画
         currentAnimation = type;
         shouldRestoreOnDestroy = true;  // 新动画默认需要恢复
+        notifyAnimationStarted(type);
         
         return oldAnimation;  // 返回被打断的旧动画
     }
@@ -110,8 +156,21 @@ public class RearAnimationManager {
         
         currentAnimation = AnimationType.NONE;
         shouldRestoreOnDestroy = true;
+        notifyAnimationEnded(type);
         
         return shouldRestore;
+    }
+
+    /**
+     * 启动失败时重置动画状态，防止 RearAnimationManager 卡死在 NOTIFICATION / CHARGING 状态。
+     */
+    public static synchronized void resetAnimationOnFailure(AnimationType type) {
+        if (currentAnimation == type) {
+            Log.w(TAG, String.format("🧹 动画[%s]启动失败，强制重置状态为 NONE", type));
+            currentAnimation = AnimationType.NONE;
+            shouldRestoreOnDestroy = true;
+            notifyAnimationEnded(type);
+        }
     }
     
     /**

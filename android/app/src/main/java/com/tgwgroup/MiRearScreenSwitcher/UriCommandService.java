@@ -129,6 +129,10 @@ public class UriCommandService extends IntentService {
     }
 
     private void bindTaskService() {
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            taskService = TaskServiceManager.getInstance(this).getLocalAdbBackend().getTaskService();
+            return;
+        }
         if (taskService != null)
             return;
 
@@ -184,12 +188,21 @@ public class UriCommandService extends IntentService {
                 Log.w(TAG, "检查背屏占用失败: " + e.getMessage());
             }
 
-            // 1. 确定目标
+            // 1. 确定目标（安全加固：严格校验 packageName 与 activity 参数，防止命令注入 Audit F5）
             String currentParam = uri.getQueryParameter("current");
             String packageName = uri.getQueryParameter("packageName");
             String activity = uri.getQueryParameter("activity");
 
             Log.d(TAG, "参数 - current: " + currentParam + ", packageName: " + packageName + ", activity: " + activity);
+
+            if (packageName != null && !com.tgwgroup.MiRearScreenSwitcher.adb.ShellCommandSanitizer.isValidPackageName(packageName)) {
+                Log.e(TAG, "❌ 拒绝非法的 packageName 参数: " + packageName);
+                return;
+            }
+            if (activity != null && !com.tgwgroup.MiRearScreenSwitcher.adb.ShellCommandSanitizer.isValidComponentName(activity)) {
+                Log.e(TAG, "❌ 拒绝非法的 activity 参数: " + activity);
+                return;
+            }
 
             if ("true".equalsIgnoreCase(currentParam) || "1".equals(currentParam)) {
                 // 切换当前应用 - 完全复用TileService逻辑
@@ -635,6 +648,10 @@ public class UriCommandService extends IntentService {
                     targetPackage = rearApp.split(":")[0];
                 }
             } else if (packageName != null) {
+                if (!com.tgwgroup.MiRearScreenSwitcher.adb.ShellCommandSanitizer.isValidPackageName(packageName)) {
+                    Log.e(TAG, "❌ 拒绝非法的 return packageName 参数: " + packageName);
+                    return;
+                }
                 String rearApp = taskService.getForegroundAppOnDisplay(1);
                 if (rearApp != null && rearApp.startsWith(packageName + ":")) {
                     targetPackage = packageName;
@@ -795,9 +812,13 @@ public class UriCommandService extends IntentService {
     public void onDestroy() {
         super.onDestroy();
 
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            taskService = null;
+            return;
+        }
         if (taskService != null) {
             try {
-                Shizuku.unbindUserService(serviceArgs, taskServiceConnection, true);
+                Shizuku.unbindUserService(serviceArgs, taskServiceConnection, false);
             } catch (Exception e) {
                 Log.e(TAG, "解绑TaskService失败", e);
             }

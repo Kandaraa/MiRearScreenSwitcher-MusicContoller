@@ -19,4 +19,6 @@
     <string name="notif_running_on_rear">running on rear screen</string>
     <string name="notif_click_to_return">Tap to switch %s back to main screen</string>
     <string name="notif_mrss_running">MRSS is currently running</string>
+    <string name="accessibility_auto_pair_label">MRSS Local ADB Auto-Activate</string>
+    <string name="accessibility_auto_pair_desc">Used only once when you tap Auto-Activate to automatically pair Wireless Debugging, then immediately disables itself.</string>
 </resources>

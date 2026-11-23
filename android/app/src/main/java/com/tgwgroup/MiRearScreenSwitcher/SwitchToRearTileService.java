@@ -128,6 +128,10 @@ public class SwitchToRearTileService extends TileService {
     }
 
     private void bindTaskService() {
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            taskService = TaskServiceManager.getInstance(this).getLocalAdbBackend().getTaskService();
+            return;
+        }
         if (taskService != null) {
             return;
         }
@@ -151,9 +155,13 @@ public class SwitchToRearTileService extends TileService {
     }
 
     private void unbindTaskService() {
+        if (TaskServiceManager.isLocalAdbMode(this)) {
+            taskService = null;
+            return;
+        }
         if (taskService != null) {
             try {
-                Shizuku.unbindUserService(serviceArgs, taskServiceConnection, true);
+                Shizuku.unbindUserService(serviceArgs, taskServiceConnection, false);
             } catch (Exception e) {
                 Log.e(TAG, "Error unbinding TaskService", e);
             }

@@ -18,6 +18,15 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <!-- 查询所有应用包权限 (Android 11+，用于通知功能选择应用) -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+    <!-- 内置本地ADB (Local ADB loopback socket, mDNS _adb-tls-* discovery & Android 17 compliance) -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.USE_LOOPBACK_INTERFACE"/>
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions"/>
     
     <application
         android:label="MRSS"
@@ -156,6 +165,43 @@
                 android:value="背屏录屏服务"/>
         </service>
 
+        <!-- 内置本地ADB无线调试配对服务（mDNS自动发现 + 通知栏快捷配对输入） -->
+        <service
+            android:name=".adb.LocalAdbPairingService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="本地ADB无线调试配对服务"/>
+        </service>
+
+        <!-- 一次性设备端自动激活无障碍服务（配对完成后立即调用disableSelf自动关闭） -->
+        <service
+            android:name=".adb.LocalAdbAutoPairAccessibilityService"
+            android:label="@string/accessibility_auto_pair_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/local_adb_accessibility_service"/>
+        </service>
+
+        <!-- 开机与更新零接触自恢复接收器（仅解锁后触发，避免Direct Boot CE存储崩溃） -->
+        <receiver
+            android:name=".adb.BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+            </intent-filter>
+        </receiver>
+
         
         <!-- 背屏唤醒Activity（已废弃，改用Service） -->
         <activity
@@ -176,7 +222,7 @@
             android:excludeFromRecents="true"
             android:launchMode="singleInstance"
             android:taskAffinity="com.tgwgroup.MiRearScreenSwitcher.wakeup">
-            <meta-data android:name="miui.rear.policy" android:value="miui"/>
+            <meta-data android:name="miui.rear.policy" android:value="2"/>
         </activity>
         
         <!-- V2.3: 背屏充电动画Activity -->
@@ -190,9 +236,8 @@
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode|smallestScreenSize|density"
             android:directBootAware="true"
             android:showWhenLocked="true"
-            android:turnScreenOn="true"
             android:hardwareAccelerated="true">
-            <meta-data android:name="miui.rear.policy" android:value="miui"/>
+            <meta-data android:name="miui.rear.policy" android:value="2"/>
         </activity>
         
         <!-- V2.4: 背屏通知显示Activity -->
@@ -205,9 +250,8 @@
             android:theme="@style/Theme.Transparent"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode|smallestScreenSize|density"
             android:directBootAware="true"
-            android:showWhenLocked="true"
-            android:turnScreenOn="true">
-            <meta-data android:name="miui.rear.policy" android:value="miui"/>
+            android:showWhenLocked="true">
+            <meta-data android:name="miui.rear.policy" android:value="2"/>
         </activity>
             
         <!-- V2.6: URI接收Activity（透明，立即转发） -->
@@ -226,20 +270,21 @@
             </intent-filter>
         </activity>
         
-        <!-- V3.6: Smart Media Rear Controller -->
+        <!-- V3.7: Native Smart Media Rear Shade Activity (zero FlutterEngine, HyperOS 4 Display 1 compliant) -->
         <activity
             android:name=".RearMediaActivity"
             android:exported="true"
-            android:theme="@style/LaunchTheme"
+            android:theme="@style/RearScreenMediaTheme"
             android:showForAllUsers="true"
             android:showWhenLocked="true"
-            android:turnScreenOn="true"
+            android:directBootAware="true"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
-            android:windowSoftInputMode="adjustResize"
             android:launchMode="singleInstance"
             android:excludeFromRecents="true"
-            android:taskAffinity=".RearMediaActivity" />
+            android:taskAffinity="com.tgwgroup.MiRearScreenSwitcher.media">
+            <meta-data android:name="miui.rear.policy" android:value="2"/>
+        </activity>
         
         <activity
             android:name=".MainActivity"
